@@ -14,126 +14,183 @@
 
 import asyncio
 
-from tqdm import tqdm
+from omegaconf.omegaconf import DictConfig
 
-from rlinf.data.io_struct import AsyncEmbodiedRolloutBuffer
-from rlinf.scheduler import Channel
-from rlinf.utils.nested_dict_process import put_tensor_device
+from rlinf.scheduler import Channel, Worker
 from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 
 
 class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
+    def __init__(self, cfg: DictConfig):
+        super().__init__(cfg)
+        self._generate_task: asyncio.Task = None
+        self.staleness_threshold = cfg.algorithm.get("staleness_threshold", None)
+        # set the decoupled rollout worker sync weight time
+        self.sync_rollout_weight_time = (
+            self.num_pipeline_stages * self.n_train_chunk_steps * self.rollout_epoch
+        )
+
+        assert not self.enable_offload, (
+            "Offload not supported in AsyncMultiStepRolloutWorker"
+        )
+
+        self._background_weight_sync_active = self.cfg.actor.get(
+            "sync_weight_no_wait", False
+        )
+        self._weight_sync_requested = False
+        self._weight_sync_work = None
+        self._weight_sync_apply_total = 0
+        self._weight_sync_coalesced_total = 0
+        self._weight_sync_request_total = 0
+
+    @Worker.timer("rollout/generate")
     async def generate(
-        self, input_channel: Channel, output_channel: Channel, replay_channel: Channel
+        self,
+        input_channel: Channel,
+        output_channel: Channel,
+        metric_channel: Channel,
     ):
-        self.buffer_list: list[AsyncEmbodiedRolloutBuffer] = [
-            AsyncEmbodiedRolloutBuffer() for _ in range(self.num_pipeline_stages)
-        ]
+        assert self._generate_task is None, (
+            "generate task is not None but generate function is called."
+        )
+        self._generate_task = asyncio.create_task(
+            self._generate(input_channel, output_channel, metric_channel)
+        )
+        try:
+            await self._generate_task
+        except asyncio.CancelledError:
+            pass
 
-        self.buffer_tasks: list[asyncio.Task] = []
-        for buffer in self.buffer_list:
-            self.buffer_tasks.append(
-                asyncio.create_task(
-                    buffer.run(replay_channel, self.get_actor_split_num())
+    async def _generate(
+        self,
+        input_channel: Channel,
+        output_channel: Channel,
+        metric_channel: Channel,
+    ):
+        if self.env_decoupled_mode:
+            await self.decoupled_generate_one_epoch(input_channel, output_channel)
+        else:
+            while True:
+                if self._background_weight_sync_active:
+                    await self._poll_background_weight_sync()
+
+                for _ in range(self.rollout_epoch):
+                    await self.generate_one_epoch(input_channel, output_channel)
+                if self.finished_episodes is not None:
+                    self.finished_episodes += (
+                        self.total_num_train_envs * self.rollout_epoch
+                    )
+                rollout_metrics = self.pop_execution_times()
+                rollout_metrics = {
+                    f"time/rollout/{k}": v for k, v in rollout_metrics.items()
+                }
+                metric_channel.put(
+                    {"rank": self._rank, "time": rollout_metrics},
+                    async_op=True,
                 )
+
+    async def wait_if_stale(self) -> None:
+        if self.staleness_threshold is None:
+            return
+        assert self.finished_episodes is not None, (
+            "finished_episodes should be initialized."
+        )
+        while True:
+            capacity = (
+                (self.staleness_threshold + self.version + 1)
+                * self.total_num_train_envs
+                * self.rollout_epoch
             )
+            if (
+                self.finished_episodes + self.total_num_train_envs * self.rollout_epoch
+                <= capacity
+            ):
+                break
+            await asyncio.sleep(0.01)
 
-        n_chunk_steps = (
-            self.cfg.env.train.max_steps_per_rollout_epoch
-            // self.cfg.actor.model.num_action_chunks
-        )
+    def stop(self):
+        if self._generate_task is not None and not self._generate_task.done():
+            self._generate_task.cancel()
 
-        progress_bar = tqdm(
-            total=None,
-            desc="Generating Rollout Epochs",
-            disable=(self._rank != 0),
-        )
+    async def _recv_and_apply_actor_sync(self) -> int:
+        await super().sync_model_from_actor()
+        return self.version
 
-        while not self.should_stop:
-            last_extracted_obs = [None for i in range(self.num_pipeline_stages)]
-            last_results = [None for i in range(self.num_pipeline_stages)]
+    def _start_background_weight_sync_if_needed(self):
+        if (
+            not self._background_weight_sync_active
+            or not self._weight_sync_requested
+            or self._weight_sync_work is not None
+        ):
+            return
 
-            for _ in range(n_chunk_steps):
-                for stage_id in range(self.num_pipeline_stages):
-                    env_output = await self.recv_env_output(input_channel)
+        self._weight_sync_requested = False
+        self._weight_sync_work = asyncio.create_task(self._recv_and_apply_actor_sync())
 
-                    if last_results[stage_id] is not None:
-                        last_results[stage_id]["forward_inputs"] = (
-                            self.update_intervene_actions(
-                                env_output, last_results[stage_id]["forward_inputs"]
-                            )
-                        )
+    @Worker.timer("rollout/poll_weight_sync")
+    async def _poll_background_weight_sync(self):
+        self._start_background_weight_sync_if_needed()
+        if self._weight_sync_work is None:
+            return
 
-                    extracted_obs = self.hf_model.preprocess_env_obs(env_output["obs"])
-                    dones, rewards, real_extracted_obs = self.get_dones_and_rewards(
-                        env_output, extracted_obs
-                    )
+        if not self._weight_sync_work.done():
+            return
 
-                    actions, result = self.predict(extracted_obs)
+        await self._weight_sync_work
+        self._weight_sync_work = None
+        self._weight_sync_apply_total += 1
 
-                    await self.buffer_list[stage_id].add(
-                        "truncations",
-                        env_output["truncations"].bool().cpu().contiguous(),
-                    )
-                    await self.buffer_list[stage_id].add(
-                        "terminations",
-                        env_output["terminations"].bool().cpu().contiguous(),
-                    )
-                    await self.buffer_list[stage_id].add("dones", dones)
-                    if rewards is not None:
-                        await self.buffer_list[stage_id].add("rewards", rewards)
-                    if last_results[stage_id] is not None:
-                        await self.buffer_list[stage_id].add_result(
-                            last_results[stage_id]
-                        )
+        self._start_background_weight_sync_if_needed()
 
-                    if last_extracted_obs[stage_id] is not None and hasattr(
-                        self.hf_model, "q_head"
-                    ):
-                        await self.buffer_list[stage_id].add_transition(
-                            last_extracted_obs[stage_id], real_extracted_obs
-                        )
+    @Worker.timer("rollout/request_weight_sync")
+    async def request_actor_sync_model(self):
+        self._weight_sync_request_total += 1
+        if self._weight_sync_requested or self._weight_sync_work is not None:
+            self._weight_sync_coalesced_total += 1
+        self._weight_sync_requested = True
+        self._start_background_weight_sync_if_needed()
 
-                    last_extracted_obs[stage_id] = extracted_obs
-                    last_results[stage_id] = result
-
-                    self.send_chunk_actions(output_channel, actions)
-
-            for i in range(self.num_pipeline_stages):
-                env_output = await self.recv_env_output(input_channel)
-                extracted_obs = self.hf_model.preprocess_env_obs(env_output["obs"])
-                dones, rewards, real_extracted_obs = self.get_dones_and_rewards(
-                    env_output, extracted_obs
-                )
-                await self.buffer_list[i].add(
-                    "truncations", env_output["truncations"].bool().cpu().contiguous()
-                )
-                await self.buffer_list[i].add(
-                    "terminations", env_output["terminations"].bool().cpu().contiguous()
-                )
-                await self.buffer_list[i].add("dones", dones)
-                if rewards is not None:
-                    await self.buffer_list[i].add("rewards", rewards)
-                if last_results is not None:
-                    await self.buffer_list[i].add_result(
-                        put_tensor_device(last_results[i], "cpu")
-                    )
-
-                with self.worker_timer():
-                    actions, result = self.predict(extracted_obs)
-                if "prev_values" in result:
-                    await self.buffer_list[i].add(
-                        "prev_values", result["prev_values"].cpu().contiguous()
-                    )
-                if hasattr(self.hf_model, "q_head"):
-                    await self.buffer_list[i].add_transition(
-                        last_extracted_obs[i], real_extracted_obs
-                    )
-
-            progress_bar.update(1)
-
-    async def stop(self):
-        self.should_stop = True
-        for buffer in self.buffer_list:
-            await buffer.stop()
-        await asyncio.gather(*self.buffer_tasks)
+    async def decoupled_generate_one_epoch(
+        self, input_channel: Channel, output_channel: Channel
+    ):
+        self.update_dagger_beta()
+        decoupled_generate_time = 1
+        while True:
+            if decoupled_generate_time % self.sync_rollout_weight_time == 0:
+                self.update_dagger_beta()
+                if self._background_weight_sync_active:
+                    await self._poll_background_weight_sync()
+                await self.wait_if_stale()
+            decoupled_generate_time = decoupled_generate_time + 1
+            (
+                env_output,
+                split_sizes,
+            ) = await self.recv_from_and_record_batch_routes_with_timeout(
+                group_name=self.cfg.env.group_name,
+                channel=input_channel,
+                tag="rollout_results",
+                batch_size=self.train_batch_size,
+                merge_fn=self._merge_obs_batches,
+                infer_batch_size_fn=self._infer_env_batch_size,
+                timeout_time=0.02,
+                recv_queue_size=self.rollout_queue_size,
+            )
+            actions, result = self._predict_rollout_actions(
+                env_output["obs"],
+                final_obs=env_output.get("final_obs", None),
+                rlt_switch_flags=env_output.get("rlt_switch_flags", None),
+                intervene_requested=env_output.get("intervene_flags", None),
+            )
+            rollout_result = self._build_rollout_result(
+                actions,
+                result,
+                final_obs=env_output.get("final_obs", None),
+            )
+            self.send_to_recorded_batch_routes(
+                group_name=self.cfg.env.group_name,
+                channel=output_channel,
+                data=rollout_result,
+                tag="rollout_results",
+                split_fn=self._split_rollout_result,
+                split_sizes=split_sizes,
+            )

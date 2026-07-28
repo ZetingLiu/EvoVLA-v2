@@ -14,9 +14,13 @@
 
 import gc
 import itertools
+from contextlib import contextmanager, nullcontext
+from functools import partial
 from typing import TYPE_CHECKING, Iterator, Optional
 
+import megatron
 import torch
+from megatron.core import tensor_parallel
 from omegaconf import DictConfig
 
 from rlinf.config import build_config, build_transformer_config
@@ -32,6 +36,7 @@ from .utils import (
     preprocess_packed_seqs,
     recover_left_padding,
     remove_left_padding,
+    tensor_rm_left_padding,
 )
 
 try:
@@ -59,9 +64,11 @@ except ImportError:
     from megatron.core.transformer.module import Float16Module
 except ImportError:
     raise "Could not import Float16Module from megatron"
+from megatron.core.optimizer import get_megatron_optimizer
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.training import (
     get_args,
+    get_optimizer_param_scheduler,
     preprocess_common_state_dict,
     setup_model_and_optimizer,
     unwrap_model,
@@ -83,6 +90,23 @@ HAVE_TE = HAVE_TE and HAVE_TE_MODULE
 
 if TYPE_CHECKING:
     pass
+
+# Check if FUSCO is available
+try:
+    import importlib.util
+    import os
+
+    from fusco import FUSCOLibrary
+
+    if importlib.util.find_spec("idxtools") is None:
+        raise ImportError
+
+    so_file = os.environ.get("FUSCO_SO_PATH", "libfusco.so")
+    fusco_lib = FUSCOLibrary(so_file)
+    HAVE_FUSCO = True
+except Exception:
+    fusco_lib = None
+    HAVE_FUSCO = False
 
 
 def get_specs(spec_name, transformer_config=None, use_te=False):
@@ -106,6 +130,51 @@ def get_specs(spec_name, transformer_config=None, use_te=False):
     return name_spec_dict[spec_name]
 
 
+# copied from verl
+class LinearForLastLayer(torch.nn.Linear):
+    def __init__(
+        self,
+        input_size,
+        output_size,
+        *,
+        sequence_parallel,
+        bias=False,  # TODO changed bias to False for temporary convenience
+    ):
+        super().__init__(in_features=input_size, out_features=output_size, bias=bias)
+        self.sequence_parallel = sequence_parallel
+        if self.sequence_parallel:
+            self.weight.sequence_parallel = True
+
+    def forward(
+        self,
+        input_,
+        weight=None,
+        runtime_gather_output=None,
+    ):
+        logits = super().forward(input_)
+        logits = logits.float()
+        if self.sequence_parallel:
+            logits = tensor_parallel.gather_from_sequence_parallel_region(
+                logits, tensor_parallel_output_grad=False
+            )
+        return logits, None
+
+
+def patch_load_checkpoint_to_be_non_strict(enable: bool):
+    @contextmanager
+    def context():
+        load_checkpoint_orig = megatron.training.training.load_checkpoint
+        load_checkpoint_patched = partial(load_checkpoint_orig, strict=False)
+        megatron.training.training.load_checkpoint = load_checkpoint_patched
+        yield
+        megatron.training.training.load_checkpoint = load_checkpoint_orig
+
+    if enable:
+        return context()
+    else:
+        return nullcontext()
+
+
 class MegatronModelManager:
     """
     Megatron Model Manager for RL training
@@ -122,6 +191,11 @@ class MegatronModelManager:
         self.transformer_config = build_transformer_config(cfg.model)
 
         self._cfg = cfg
+        self.mbridge = cfg.megatron.get("mbridge", False)
+        # if use the megatron-mbridge need patch some function
+        if self.mbridge:
+            self.patch_mbrdige_function()
+
         self.mcore_gpt = cfg.mcore_gpt
         self.spec_name = cfg.spec_name
         self.distributed_adam_offload_manager = None
@@ -133,7 +207,15 @@ class MegatronModelManager:
         self.checkpoint_context = self._get_checkpoint_context()
 
         if self._cfg.megatron.use_hf_ckpt:
-            self._cfg.megatron.load = self._cfg.megatron.ckpt_convertor.save_path
+            if self.mbridge:
+                if hasattr(self, "megatron_type") and self.megatron_type == "sft":
+                    self._cfg.megatron.load = self._cfg.model.model_path
+                else:
+                    self._cfg.megatron.load = (
+                        self._cfg.megatron.ckpt_convertor.hf_model_path
+                    )
+            else:
+                self._cfg.megatron.load = self._cfg.megatron.ckpt_convertor.save_path
 
         config = build_config(ModelConfig, cfg.model)
         self.flops_calculator = FLOPSCalculator(config)
@@ -141,15 +223,150 @@ class MegatronModelManager:
         # In AUTO mode, the actor will occupy all GPUs for initialization, but not all Megatron processes will be in the running state.
         self.is_running = True
 
+        self.is_dedicated_critic_model = self._cfg.get("use_critic_model", False)
+
+        self.is_weight_offloaded = False
+        self.is_grad_offloaded = False
+        self.is_optimizer_offloaded = False
+
+        # Patch Megatron MoE token dispatcher if FUSCO is available and conditions are met
+        self.patch_megatron_moe_dispatcher()
+
+    def patch_mbrdige_function(self):
+        from rlinf.utils.patcher import Patcher
+
+        Patcher.clear()
+        Patcher.add_patch(
+            "megatron.bridge.models.qwen_vl.modelling_qwen3_vl.utils.get_rope_index",
+            "rlinf.hybrid_engines.megatron.utils.get_rope_index",
+        )
+        Patcher.apply()
+
+        self._logger.info("Use the megatron-Mbrdige, patched the fix function Success.")
+
+    def patch_megatron_moe_dispatcher(self):
+        if HAVE_FUSCO:
+            from rlinf.utils.patcher import Patcher
+
+            Patcher.clear()
+            Patcher.add_patch(
+                "megatron.core.transformer.moe.token_dispatcher.MoEAlltoAllTokenDispatcher",
+                "rlinf.hybrid_engines.megatron.token_dispatcher.MoEAlltoAllTokenDispatcher",
+            )
+            Patcher.apply()
+
+            self._logger.info(
+                "FUSCO library loaded successfully, Megatron MoE token dispatcher patched"
+            )
+
     def setup_model_and_optimizer(self, model_type=ModelType.encoder_or_decoder):
         """Setup model and optimizer."""
         set_megatron_args(self._cfg)
+        if self.mbridge:
+            self.model, self.optimizer, self.lr_scheduler = (
+                self.setup_mbridge_model_and_optimizer()
+            )
+        else:
+            # if it is the critic model, then we must set the strict parameter
+            # of load_checkpoint to false, because we replaced
+            # the output layer of the critic model to value head,
+            # resulting in a mismatch with the checkpoint.
+            enable_none_strict = self.is_dedicated_critic_model
+            with patch_load_checkpoint_to_be_non_strict(enable=enable_none_strict):
+                self.model, self.optimizer, self.lr_scheduler = (
+                    setup_model_and_optimizer(
+                        model_provider_func=self.model_provider_func,
+                        model_type=model_type,
+                        checkpointing_context=self.checkpoint_context,
+                    )
+                )
 
-        self.model, self.optimizer, self.lr_scheduler = setup_model_and_optimizer(
-            model_provider_func=self.model_provider_func,
-            model_type=model_type,
-            checkpointing_context=self.checkpoint_context,
+    def setup_mbridge_model_and_optimizer(self):
+        # Init megatron bridge
+        from megatron.bridge import AutoBridge
+        from megatron.bridge.training.config import DistributedDataParallelConfig
+
+        self.bridge = AutoBridge.from_hf_pretrained(
+            self._cfg.megatron.load,
+            trust_remote_code=True,
         )
+        provider = self.bridge.to_megatron_provider(load_weights=True)
+        from dataclasses import fields
+
+        provider_field_names = {f.name for f in fields(type(provider))}
+        mrope_section = getattr(provider, "mrope_section", [16, 24, 24])
+        position_embedding_type = getattr(provider, "position_embedding_type", "mrope")
+
+        # Set the provider field with the RLinf transformer_config
+        for name in provider_field_names:
+            if hasattr(self.transformer_config, name):
+                setattr(provider, name, getattr(self.transformer_config, name))
+
+        # Preserve HF/provider-specific multimodal rope values.
+        provider.mrope_section = mrope_section
+        provider.position_embedding_type = position_embedding_type
+        if hasattr(provider, "vision_config"):
+            provider.vision_config._attn_implementation = "flash_attention_2"
+
+        # the Mbridge run the qwen3-vl-moe model will freeze the language model and vision model by default.
+        provider.freeze_language_model = getattr(
+            self._cfg.model, "freeze_language_model", False
+        )
+        provider.freeze_vision_model = getattr(
+            self._cfg.model, "freeze_vision_model", False
+        )
+        provider.freeze_vision_projection = getattr(
+            self._cfg.model, "freeze_vision_projection", False
+        )
+
+        if (
+            getattr(self._cfg.model, "decoder_first_pipeline_num_layers", None)
+            is not None
+        ):
+            provider.num_layers_in_first_pipeline_stage = (
+                self._cfg.model.decoder_first_pipeline_num_layers
+            )
+        if (
+            getattr(self._cfg.model, "decoder_last_pipeline_num_layers", None)
+            is not None
+        ):
+            provider.num_layers_in_last_pipeline_stage = (
+                self._cfg.model.decoder_last_pipeline_num_layers
+            )
+
+        if self._rank == 0:
+            self._logger.info(f"Mbridge Set Provider: {provider}")
+
+        provider.finalize()
+        self.provider = provider
+        ddp_config = DistributedDataParallelConfig(
+            use_distributed_optimizer=self._cfg.optim.use_distributed_optimizer,
+            overlap_grad_reduce=self._cfg.optim.get("overlap_grad_reduce", False),
+            overlap_param_gather=self._cfg.optim.get("overlap_param_gather", False),
+            check_for_nan_in_grad=True,
+            grad_reduce_in_fp32=True,
+        )
+        ddp_config.finalize()
+
+        # Get Megatron Model
+        model = self.provider.provide_distributed_model(ddp_config=ddp_config)
+
+        args = get_args()
+        from megatron.training.training import get_megatron_optimizer_config
+
+        config, config_overrides = get_megatron_optimizer_config(args)
+
+        # Get Megatron Optimizer
+        optimizer = get_megatron_optimizer(
+            config,
+            model,
+            config_overrides=config_overrides,
+            use_gloo_process_groups=args.enable_gloo_process_groups,
+        )
+        # Get Megatron Optimizer Param Scheduler
+        lr_scheduler = get_optimizer_param_scheduler(optimizer)
+
+        return model, optimizer, lr_scheduler
 
     def model_provider_func(self, pre_process, post_process):
         """Model depends on pipeline paralellism."""
@@ -188,6 +405,15 @@ class MegatronModelManager:
                 pre_process=pre_process,
                 post_process=post_process,
             )
+
+        if self.is_dedicated_critic_model and post_process:
+            # replace lm head with value head if this is a critic model
+            model.output_layer = LinearForLastLayer(
+                input_size=self._cfg.model.hidden_size,
+                output_size=1,
+                sequence_parallel=self._cfg.model.sequence_parallel,
+            )
+
         return model
 
     def optimizer_step(self, increment):
@@ -289,6 +515,23 @@ class MegatronModelManager:
             checkpointing_context = {}
         return checkpointing_context
 
+    @contextmanager
+    def ensure_onloaded_and_then_offload(self):
+        # if weights and opt states are offloaded, recover them first
+        if self.is_weight_offloaded:
+            self.onload_model_weights_and_grad()
+        if self.is_optimizer_offloaded:
+            self.onload_megatron_optimizer()
+
+        yield
+
+        # Now sft don't need to offload the weight, grad and optimizer
+        if hasattr(self, "megatron_type") and self.megatron_type == "sft":
+            return
+
+        self.offload_model_weights_and_grad()
+        self.offload_megatron_optimizer()
+
     def save_checkpoint(
         self,
         save_path: str,
@@ -297,27 +540,44 @@ class MegatronModelManager:
     ) -> None:
         if not self.is_running:
             return
-        args = get_args()
-        args.save = save_path
-        save_checkpoint(
-            iteration=step,
-            model=self.model,
-            optimizer=self.optimizer,
-            opt_param_scheduler=self.lr_scheduler,
-            num_floating_point_operations_so_far=num_floating_point_operations_so_far,
-            checkpointing_context=self.checkpoint_context,
-            preprocess_common_state_dict_fn=preprocess_common_state_dict,
-        )
+
+        with self.ensure_onloaded_and_then_offload():
+            if self.mbridge:
+                # save mbridge checkpoint to hf checkpoint
+                hf_save_path = os.path.join(save_path, "hf_checkpoint")
+                self.bridge.save_hf_pretrained(
+                    self.model,
+                    hf_save_path,
+                    source_path=self._cfg.megatron.load,
+                    show_progress=(torch.distributed.get_rank() == 0),
+                    strict=True,
+                )
+            # for the next training, we also need to save the megatron checkpoint
+
+            args = get_args()
+            args.save = save_path
+            save_checkpoint(
+                iteration=step,
+                model=self.model,
+                optimizer=self.optimizer,
+                opt_param_scheduler=self.lr_scheduler,
+                num_floating_point_operations_so_far=num_floating_point_operations_so_far,
+                checkpointing_context=self.checkpoint_context,
+                preprocess_common_state_dict_fn=preprocess_common_state_dict,
+            )
 
     def load_checkpoint(self, load_path):
-        args = get_args()
-        args.load = load_path
-        load_checkpoint(
-            self.model,
-            self.optimizer,
-            self.lr_scheduler,
-            checkpointing_context=self.checkpoint_context,
-        )
+        with self.ensure_onloaded_and_then_offload():
+            args = get_args()
+            args.load = load_path
+            if self.mbridge:
+                args.phase_transition_iterations = None
+            load_checkpoint(
+                self.model,
+                self.optimizer,
+                self.lr_scheduler,
+                checkpointing_context=self.checkpoint_context,
+            )
 
     def load_state_dict(self, state_dict, strict=True):
         if len(self.model) == 1:
@@ -352,6 +612,9 @@ class MegatronModelManager:
         logits_processor_args: Optional[dict] = None,
         temperature: float = 1.0,
         max_batch_seqlen: int = 4096,
+        padding_seqlen: Optional[int] = None,
+        keep_left_padding: bool = False,
+        **model_forward_kwargs,
     ):
         """Default forward pass for GPT models with optional sequence packing."""
         pre_process = unwrap_model(model).pre_process
@@ -359,7 +622,10 @@ class MegatronModelManager:
         if pack_seqs:
             batch_size, seq_len = attention_mask.shape[:2]
             input_ids_rmpad, packed_seq_params = preprocess_packed_seqs(
-                input_ids, attention_mask, pre_process=pre_process
+                input_ids,
+                attention_mask,
+                pre_process=pre_process,
+                padding_seqlen=padding_seqlen,
             )
             input_ids_rmpad = input_ids_rmpad.contiguous()
             output_orig = model(
@@ -367,11 +633,17 @@ class MegatronModelManager:
                 attention_mask=None,
                 position_ids=position_ids,
                 packed_seq_params=packed_seq_params,
+                **model_forward_kwargs,
             )
             output_orig /= temperature
             if post_process and logits_processor is not None:
                 args = {
-                    k: preprocess_packed_seqs(v, attention_mask, pre_process=True)[0]
+                    k: preprocess_packed_seqs(
+                        v,
+                        attention_mask,
+                        pre_process=True,
+                        padding_seqlen=padding_seqlen,
+                    )[0]
                     for k, v in logits_processor_args.items()
                 }
                 output_dict = logits_processor(output_orig, **args)
@@ -396,99 +668,189 @@ class MegatronModelManager:
                     post_process=post_process,
                 )
         else:
-            assert logits_processor is None, (
-                "logits_processor is not supported for non-packed sequence"
-            )
             batch_size, sequence_length = attention_mask.shape
+            # if keep_left_padding is True, we will handle new_input_ids of all pp stages
             new_input_ids, new_attention_mask, new_position_ids = remove_left_padding(
                 input_ids,
                 attention_mask,
                 position_ids,
                 sequence_parallel,
-                pre_process=pre_process,
+                pre_process=pre_process or keep_left_padding,
             )
-            output = model(
+            output_orig = model(
                 input_ids=new_input_ids,
                 attention_mask=new_attention_mask,
                 position_ids=new_position_ids,
+                **model_forward_kwargs,
             )
-            output = recover_left_padding(
-                output,
-                new_attention_mask,
-                attention_mask,
-                sequence_length,
-                post_process=post_process,
-            )
+            output_orig /= temperature
+            if post_process and logits_processor is not None:
+                args = {
+                    k: tensor_rm_left_padding(v, attention_mask, sequence_parallel)
+                    for k, v in (logits_processor_args or {}).items()
+                }
+                output_dict = logits_processor(output_orig, **args)
+                output = {
+                    k: recover_left_padding(
+                        v,
+                        new_attention_mask,
+                        attention_mask,
+                        sequence_length,
+                        post_process=post_process,
+                    )
+                    if torch.is_tensor(v)
+                    and v.ndim >= 2
+                    and v.shape[:2] == new_attention_mask.shape
+                    else v
+                    for k, v in output_dict.items()
+                }
+            else:
+                output = recover_left_padding(
+                    output_orig,
+                    new_attention_mask,
+                    attention_mask,
+                    sequence_length,
+                    post_process=post_process,
+                )
+
         if value_model and post_process:
             output = output[..., 0]
         return output
 
+    def _get_pinned_buffer(self, tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Get or create a pinned CPU buffer for the given tensor.
+        Creates a pinned memory buffer on first call and caches it as `cpu_data` on `tensor`.
+        Subsequent calls return the cached buffer for efficient DMA transfers.
+        Args:
+            tensor: The GPU tensor to create a pinned buffer for.
+        Returns:
+            A pinned CPU tensor with the same size, dtype, and layout as the input.
+        """
+
+        needed_size = tensor.untyped_storage().size()
+
+        # check if there is a reusable buffer
+        if hasattr(tensor, "cpu_data"):
+            existing = getattr(tensor, "cpu_data")
+            if (
+                existing is not None
+                and existing.untyped_storage().size() >= needed_size
+            ):
+                return existing
+
+        # create new buffer (slightly larger to reuse)
+        new_buffer = torch.empty(
+            tensor.shape,
+            dtype=tensor.dtype,
+            pin_memory=True,
+            device="cpu",
+        )
+
+        setattr(tensor, "cpu_data", new_buffer)
+        return new_buffer
+
     def offload_model_weights_and_grad(self, offload_grad=True, offload_weight=True):
+        if (not offload_grad or self.is_grad_offloaded) and (
+            not offload_weight or self.is_weight_offloaded
+        ):
+            return
+
         for model_idx, model_chunk in enumerate(self.model):
             if isinstance(model_chunk, DDP):
                 for buffer_idx, buffer in enumerate(model_chunk.buffers):
                     if (
                         offload_weight
+                        and not self.is_weight_offloaded
                         and buffer.param_data.untyped_storage().size() > 0
                     ):
                         param_size = buffer.param_data.untyped_storage().size()
 
-                        buffer.param_data.cpu_data = (
-                            buffer.param_data.data.cpu().pin_memory()
-                        )
+                        cpu_data = self._get_pinned_buffer(buffer.param_data)
+                        cpu_data.copy_(buffer.param_data, non_blocking=True)
                         buffer.param_data_size = param_size
 
                         buffer.param_data.untyped_storage().resize_(0)
 
                         assert (
-                            buffer.param_data_size
-                            == buffer.param_data.cpu_data.untyped_storage().size()
+                            buffer.param_data_size == cpu_data.untyped_storage().size()
                         )
 
-                    if offload_grad and buffer.grad_data.untyped_storage().size() > 0:
+                    if (
+                        offload_grad
+                        and not self.is_grad_offloaded
+                        and buffer.grad_data.untyped_storage().size() > 0
+                    ):
                         grad_size = buffer.grad_data.untyped_storage().size()
                         buffer.grad_data_size = grad_size
                         buffer.grad_data.untyped_storage().resize_(0)
 
             else:
                 for param_name, param in model_chunk.named_parameters():
-                    if offload_weight and param.data is not None:
-                        param.data = param.data.to("cpu", non_blocking=True)
+                    if (
+                        offload_weight
+                        and not self.is_weight_offloaded
+                        and param.data is not None
+                    ):
+                        cpu_data = self._get_pinned_buffer(param.data)
+                        cpu_data.copy_(param.data, non_blocking=True)
 
-                    if offload_grad and param.grad is not None:
-                        param.grad = param.grad.to("cpu", non_blocking=True)
+                    if (
+                        offload_grad
+                        and not self.is_grad_offloaded
+                        and param.grad is not None
+                    ):
+                        cpu_data = self._get_pinned_buffer(param.grad)
+                        cpu_data.copy_(param.grad, non_blocking=True)
 
-        # clear memory
         clear_memory()
 
+        if offload_grad:
+            self.is_grad_offloaded = True
+        if offload_weight:
+            self.is_weight_offloaded = True
+
     def onload_model_weights_and_grad(self, load_grad=True):
+        if (not self.is_weight_offloaded) and (
+            not (load_grad and self.is_grad_offloaded)
+        ):
+            return
+
         gc.collect()
         torch.cuda.empty_cache()
         for model_chunk in self.model:
             if isinstance(model_chunk, DDP):
                 for buffer in model_chunk.buffers:
                     # sometimes, we don't want to load grad for pure inference
-                    if load_grad and hasattr(buffer, "grad_data_size"):
-                        buffer.grad_data.untyped_storage().resize_(
-                            buffer.grad_data_size
-                        )
-                        buffer.grad_data.zero_()
+                    if load_grad and self.is_grad_offloaded:
+                        if hasattr(buffer, "grad_data_size"):
+                            buffer.grad_data.untyped_storage().resize_(
+                                buffer.grad_data_size
+                            )
+                            buffer.grad_data.zero_()
 
-                    if buffer.param_data.untyped_storage().size() == 0:
-                        buffer.param_data.untyped_storage().resize_(
-                            buffer.param_data_size
-                        )
-                        # copy data from cpu to cuda
-                        buffer.param_data.copy_(
-                            buffer.param_data.cpu_data, non_blocking=True
-                        )
+                    if self.is_weight_offloaded:
+                        if buffer.param_data.untyped_storage().size() == 0:
+                            buffer.param_data.untyped_storage().resize_(
+                                buffer.param_data_size
+                            )
+                            # copy data from cpu to cuda
+                            buffer.param_data.copy_(
+                                buffer.param_data.cpu_data, non_blocking=True
+                            )
             else:
                 device_id = torch.cuda.current_device()
                 for _, param in model_chunk.named_parameters():
-                    param.data = param.data.to(device_id, non_blocking=True)
-                    if load_grad and param.grad is not None:
-                        param.grad = param.grad.to(device_id, non_blocking=True)
+                    if self.is_weight_offloaded:
+                        param.data = param.data.to(device_id, non_blocking=True)
+                    if load_grad and self.is_grad_offloaded:
+                        if param.grad is not None:
+                            param.grad = param.grad.to(device_id, non_blocking=True)
         clear_memory()
+
+        self.is_weight_offloaded = False
+        if load_grad:
+            self.is_grad_offloaded = False
 
     def offload_megatron_copy_params(self, optimizers):
         """
@@ -569,6 +931,9 @@ class MegatronModelManager:
                 load_group_to_gpu(_opt.shard_fp32_from_float16_groups)
 
     def offload_megatron_optimizer(self):
+        if self.is_optimizer_offloaded:
+            return
+
         def _iter_opts(opt):
             if isinstance(opt, ChainedOptimizer):
                 return opt.chained_optimizers
@@ -580,15 +945,22 @@ class MegatronModelManager:
                 # Offloading through resetting the storage size can ensure that the tensor can be offloaded correctly even when it has tensor views.
                 if "exp_avg" in v and v["exp_avg"].is_cuda:
                     buffer = v["exp_avg"]
-                    buffer.cpu_data = buffer.data.cpu().pin_memory()
+                    cpu_data = self._get_pinned_buffer(buffer)
+                    cpu_data.copy_(buffer.data, non_blocking=True)
                     buffer.storage().resize_(0)
                 if "exp_avg_sq" in v and v["exp_avg_sq"].is_cuda:
                     buffer = v["exp_avg_sq"]
-                    buffer.cpu_data = buffer.data.cpu().pin_memory()
+                    cpu_data = self._get_pinned_buffer(buffer)
+                    cpu_data.copy_(buffer.data, non_blocking=True)
                     buffer.storage().resize_(0)
         clear_memory()
 
+        self.is_optimizer_offloaded = True
+
     def onload_megatron_optimizer(self):
+        if not self.is_optimizer_offloaded:
+            return
+
         def _iter_opts(opt):
             if isinstance(opt, ChainedOptimizer):
                 return opt.chained_optimizers
@@ -597,15 +969,16 @@ class MegatronModelManager:
         for _opt in _iter_opts(self.optimizer):
             self.load_megatron_copy_params(_opt)
             for v in _opt.optimizer.state.values():
-                if "exp_avg" in v:
+                if "exp_avg" in v and v["exp_avg"].is_cuda:
                     v["exp_avg"].data = v["exp_avg"].cpu_data.to(
                         torch.cuda.current_device(), non_blocking=True
                     )
-                if "exp_avg_sq" in v:
+                if "exp_avg_sq" in v and v["exp_avg_sq"].is_cuda:
                     v["exp_avg_sq"].data = v["exp_avg_sq"].cpu_data.to(
                         torch.cuda.current_device(), non_blocking=True
                     )
         clear_memory()
+        self.is_optimizer_offloaded = False
 
     def init_profiler(self):
         # here we should validate profiler's schedule info

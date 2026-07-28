@@ -19,12 +19,13 @@ from typing import ContextManager, Union
 import torch
 import torch.nn as nn
 from omegaconf import DictConfig
-from torch.amp.grad_scaler import GradScaler
+from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
+from torch.distributed.tensor import DTensor
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForVision2Seq
 
-from rlinf.config import SupportedModel, get_supported_model, torch_dtype_from_precision
+from rlinf.config import SupportedModel, torch_dtype_from_precision
 from rlinf.data.tokenizers import hf_tokenizer
 from rlinf.hybrid_engines.fsdp import (
     FSDP,
@@ -35,8 +36,12 @@ from rlinf.hybrid_engines.fsdp.utils import (
     create_device_mesh,
     get_lr_scheduler,
 )
+from rlinf.scheduler import Worker
 from rlinf.utils.logging import get_logger
-from rlinf.utils.utils import warmup_optimizer_state
+from rlinf.utils.utils import (
+    collect_param_names_need_sync,
+    warmup_optimizer_state,
+)
 
 warnings.filterwarnings(
     "ignore",
@@ -61,6 +66,15 @@ class FSDPModelManager:
         self._cfg = cfg
         self._logger = get_logger()
         self.torch_dtype = torch_dtype_from_precision(self._cfg.model.precision)
+        if self.torch_dtype != torch.float32:
+            self._logger.warning(
+                "Provided there is sufficient GPU memory, "
+                "set the actor.model.precision parameter to fp32 "
+                "to allow the optimizer to run in fp32 for better convergence. "
+                "Meanwhile, setting mixed_precision.param_dtype to 16-bit dtype "
+                "can help maximize speed, as it will automatically "
+                "convert fp32 to fp16 during operator execution."
+            )
 
         self.optimizer_steps = 0
         self.critic_warmup_steps = 0
@@ -70,13 +84,10 @@ class FSDPModelManager:
             self.critic_warmup_steps = self._cfg.optim.critic_warmup_steps
         self.store_requires_grad_param_name = []
 
-        self.model_path = self._cfg.model.model_path
         if cfg.get("tokenizer", {}).get("tokenizer_model", None) is not None:
             self.tokenizer = hf_tokenizer(cfg.tokenizer.tokenizer_model)
 
-        self._device_mesh = create_device_mesh(
-            world_size, self._cfg.fsdp_config.get("fsdp_size", -1)
-        )
+        self._device_mesh = create_device_mesh(world_size)
         self._dp_group = (
             self._device_mesh["ddp"].get_group()
             if "ddp" in self._device_mesh.mesh_dim_names
@@ -88,11 +99,16 @@ class FSDPModelManager:
         )
         self.amp_context = self._create_amp_context()
 
-        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-        self.device = torch.cuda.current_device()
+        Worker.torch_platform.set_device(int(os.environ["LOCAL_RANK"]))
+        self.device = Worker.torch_platform.current_device()
 
         self.is_weight_offloaded = False
         self.is_optimizer_offloaded = False
+
+        # Bucket capacity for weight sync (in bytes), default 128MB
+        self.bucket_capacity = cfg.get("sync_bucket_capacity", 128 * 1024 * 1024)
+
+        self.param_names_need_sync: list[str] = None
 
     def _create_amp_context(self) -> ContextManager:
         """
@@ -104,11 +120,13 @@ class FSDPModelManager:
         """
         from contextlib import nullcontext
 
-        if not self._cfg.fsdp_config.amp.enabled:
+        if not self._cfg.fsdp_config.amp_autocast.enabled:
             self._logger.info("[FSDP] AMP is disabled.")
             return nullcontext()
 
-        precision = torch_dtype_from_precision(self._cfg.fsdp_config.amp.precision)
+        precision = torch_dtype_from_precision(
+            self._cfg.fsdp_config.amp_autocast.precision
+        )
 
         self._logger.info(f"[FSDP] AMP is enabled with precision: {precision}.")
 
@@ -127,9 +145,11 @@ class FSDPModelManager:
 
         use_triton = cfg.get("use_triton", True)
 
-        assert torch.cuda.is_available(), "CUDA is not available."
+        assert Worker.torch_platform.is_available(), (
+            f"Accelerator type {Worker.torch_device_type} is not available."
+        )
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        device = torch.device(f"cuda:{local_rank}")
+        device = torch.device(f"{Worker.torch_device_type}:{local_rank}")
 
         model_config = AutoConfig.from_pretrained(
             cfg.model.model_path,
@@ -191,31 +211,33 @@ class FSDPModelManager:
             from liger_kernel.transformers import (
                 apply_liger_kernel_to_qwen2,
                 apply_liger_kernel_to_qwen2_5_vl,
+                apply_liger_kernel_to_qwen3_moe,
+                apply_liger_kernel_to_qwen3_vl,
+                apply_liger_kernel_to_qwen3_vl_moe,
             )
 
-            MODEL_LIGER_KERNEL_APPLY_FUNC = {
-                SupportedModel.QWEN2_5: (
-                    apply_liger_kernel_to_qwen2,
-                    {
-                        "rope": True,
-                        "rms_norm": True,
-                        "swiglu": True,
-                        "fused_linear_cross_entropy": True,
-                    },
-                ),
-                SupportedModel.QWEN2_5_VL: (
-                    apply_liger_kernel_to_qwen2_5_vl,
-                    {
-                        "rope": True,
-                        "rms_norm": True,
-                        "swiglu": True,
-                        "fused_linear_cross_entropy": True,
-                    },
-                ),
+            LIGER_COMMON_KWARGS = {
+                "rope": True,
+                "rms_norm": True,
+                "swiglu": True,
+                "fused_linear_cross_entropy": True,
             }
-            model_type = get_supported_model(
-                self._cfg.model.get("model_type", "").lower()
-            )
+
+            _liger_func_by_model = {
+                SupportedModel.QWEN2_5: apply_liger_kernel_to_qwen2,
+                SupportedModel.QWEN2_5_VL: apply_liger_kernel_to_qwen2_5_vl,
+                SupportedModel.QWEN2_5_VL_SFT: apply_liger_kernel_to_qwen2_5_vl,
+                SupportedModel.QWEN3_VL_SFT: apply_liger_kernel_to_qwen3_vl,
+                SupportedModel.QWEN3_MOE: apply_liger_kernel_to_qwen3_moe,
+                SupportedModel.QWEN3_VL_MOE_SFT: apply_liger_kernel_to_qwen3_vl_moe,
+            }
+
+            MODEL_LIGER_KERNEL_APPLY_FUNC = {
+                model_type: (apply_fn, dict(LIGER_COMMON_KWARGS))
+                for model_type, apply_fn in _liger_func_by_model.items()
+            }
+
+            model_type = SupportedModel(self._cfg.model.get("model_type", "").lower())
             if model_type in MODEL_LIGER_KERNEL_APPLY_FUNC:
                 apply_func, apply_kwargs = MODEL_LIGER_KERNEL_APPLY_FUNC[model_type]
                 apply_func(
@@ -241,10 +263,27 @@ class FSDPModelManager:
 
         # Enable gradient checkpointing if configured
         if self._cfg.fsdp_config.get("gradient_checkpointing", False):
-            self._logger.info("[FSDP] Enabling gradient checkpointing")
-            module.gradient_checkpointing_enable()
+            use_reentrant = self._cfg.fsdp_config.get(
+                "gradient_checkpointing_use_reentrant", True
+            )
+            self._logger.info(
+                f"[FSDP] Enabling gradient checkpointing with use_reentrant={use_reentrant}"
+            )
+            if use_reentrant:
+                # use_reentrant=True is the default for HuggingFace models.
+                # We pass no arguments to stay compatible with openpi's
+                # PI0Pytorch.gradient_checkpointing_enable, which takes none.
+                module.gradient_checkpointing_enable()
+            else:
+                module.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={"use_reentrant": use_reentrant}
+                )
         else:
             self._logger.info("[FSDP] Gradient checkpointing is disabled")
+
+        # here record the original trainable parameters' names before FSDP wrapping
+        # persist buffers' names are also recorded, which will be used for weight syncing.
+        self.param_names_need_sync = collect_param_names_need_sync(module)
 
         # build model, optimizer, lr_scheduler, grad_scaler
         self.model = self._strategy.wrap_model(
@@ -254,9 +293,21 @@ class FSDPModelManager:
             model=self.model, enable_critic_warmup=self.critic_warmup_steps > 0
         )
 
-        self.lr_scheduler = self.build_lr_scheduler(optimizer=self.optimizer)
+        self.lr_scheduler = self.build_lr_scheduler(
+            optimizer=self.optimizer, optim_config=self._cfg.optim
+        )
+
+        assert self._cfg.fsdp_config.get("grad_scaler") is not None, (
+            "fsdp_config.grad_scaler must be initialized before this step."
+        )
+
+        kwargs = {}
+        for key in ["init_scale", "growth_interval"]:
+            value = self._cfg.fsdp_config.grad_scaler.get(key, None)
+            if value is not None:
+                kwargs[key] = value
         self.grad_scaler = self.build_grad_scaler(
-            self._cfg.fsdp_config.amp.use_grad_scaler
+            self._cfg.fsdp_config.grad_scaler.get("enabled", False), **kwargs
         )
 
     def get_model_state_dict(self, cpu_offload: bool, full_state_dict: bool) -> dict:
@@ -283,6 +334,13 @@ class FSDPModelManager:
         Args:
             load_path: the directory to load checkpoint.
         """
+        if self.is_weight_offloaded:
+            self.load_param_and_grad(self.device)
+            self.is_weight_offloaded = False
+        if self.is_optimizer_offloaded:
+            self.load_optimizer(self.device)
+            self.is_optimizer_offloaded = False
+
         self._strategy.load_checkpoint(
             self.model, self.optimizer, self.lr_scheduler, load_path
         )
@@ -295,13 +353,28 @@ class FSDPModelManager:
         Args:
             save_path: the directory to save checkpoint.
         """
+        restore_weight_offload = self.is_weight_offloaded
+        restore_optimizer_offload = self.is_optimizer_offloaded
+
+        if restore_weight_offload:
+            self.load_param_and_grad(self.device)
+        if restore_optimizer_offload:
+            self.load_optimizer(self.device)
+
         self._strategy.save_checkpoint(
-            self.model_path,
             self.model,
             self.optimizer,
             self.lr_scheduler,
             save_path,
+            save_full_model_weights=self._cfg.fsdp_config.get(
+                "save_full_model_weights", True
+            ),
         )
+
+        if restore_weight_offload:
+            self.offload_param_and_grad()
+        if restore_optimizer_offload:
+            self.offload_optimizer()
 
     def offload_param_and_grad(self, offload_grad: bool = False) -> None:
         """
@@ -349,7 +422,7 @@ class FSDPModelManager:
             A tuple of (grad_norm, lr_list), lr_list contains learning rates for all param groups.
         """
         self.optimizer_steps += 1
-        self.grad_scaler.unscale_(optimizer=self.optimizer)
+        self.grad_scaler.unscale_(self.optimizer)
         grad_norm = self._strategy.clip_grad_norm_(
             model=self.model,
         )
@@ -368,36 +441,49 @@ class FSDPModelManager:
             if self.optimizer_steps >= self.critic_warmup_steps:
                 self.optimizer = self.build_optimizer(model=self.model)
                 self.critic_warmup_steps = 0
+                self.lr_scheduler = self.build_lr_scheduler(
+                    optimizer=self.optimizer,
+                    optim_config=self._cfg.optim,
+                )
         else:
             lr_list = [group["lr"] for group in self.optimizer.param_groups]
 
         return grad_norm, lr_list
 
-    def build_lr_scheduler(self, optimizer: Optimizer) -> LRScheduler:
+    def build_lr_scheduler(
+        self, optimizer: Optimizer, optim_config: DictConfig, last_epoch: int = -1
+    ) -> LRScheduler:
         """
         Build the learning rate scheduler based on the configuration.
         Currently only support LambdaLR scheduler with various warmup styles.
 
         Args:
             optimizer (Optimizer): The optimizer for which to schedule the learning rate.
+            optim_config (DictConfig): The optimizer config.
+            last_epoch (int): The scheduler epoch to resume from.
 
         Returns:
             LRScheduler: The learning rate scheduler.
         """
-        total_steps = self._cfg.optim.get("total_training_steps", 0)
-        num_warmup_steps = int(self._cfg.optim.get("lr_warmup_steps", -1))
-        warmup_style = self._cfg.optim.get("warmup_style", "constant")
-        num_cycles = self._cfg.optim.get("num_cycles", 0.5)
+        total_steps = optim_config.get("total_training_steps", 0)
+        num_warmup_steps = int(optim_config.get("lr_warmup_steps", -1))
+        lr_scheduler = optim_config.get("lr_scheduler", "constant")
+        num_cycles = optim_config.get("num_cycles", 0.5)
+        min_lr = optim_config.get("min_lr", 0.0)
+        min_lr_rate = optim_config.get("min_lr_rate", None)
         if num_warmup_steps < 0:
-            num_warmup_steps_ratio = self._cfg.optim.get("lr_warmup_steps_ratio", 0.0)
+            num_warmup_steps_ratio = optim_config.get("lr_warmup_steps_ratio", 0.0)
             num_warmup_steps = int(num_warmup_steps_ratio * total_steps)
 
         return get_lr_scheduler(
-            warmup_style=warmup_style,
+            lr_scheduler=lr_scheduler,
             optimizer=optimizer,
             num_warmup_steps=num_warmup_steps,
             num_training_steps=total_steps,
             num_cycles=num_cycles,
+            min_lr=min_lr,
+            min_lr_rate=min_lr_rate,
+            last_epoch=last_epoch,
         )
 
     def build_optimizer(
@@ -459,11 +545,31 @@ class FSDPModelManager:
                     "betas": betas,
                 }
             )
-        optimizer = torch.optim.AdamW(
-            param_groups,
-            eps=adam_eps,
-            weight_decay=weight_decay,
+
+        # Fused AdamW avoids a large foreach temp buffer during warmup_optimizer_state
+        # for NO_SHARD models (e.g. STEAM ensemble SFT). It is unsafe with sharded
+        # FSDP params + grad_scaler.step() and can fail at runtime with:
+        # "output with shape [] doesn't match the broadcast shape [1]".
+        all_params = [p for group in param_groups for p in group["params"]]
+        use_fused_adamw = (
+            self._cfg.fsdp_config.get("sharding_strategy", "full_shard") == "no_shard"
+            and Worker.torch_device_type == "cuda"
+            and Worker.torch_platform.is_available()
+            and not any(p.dim() == 0 for p in all_params)
         )
+        try:
+            optimizer = torch.optim.AdamW(
+                param_groups,
+                eps=adam_eps,
+                weight_decay=weight_decay,
+                fused=use_fused_adamw,
+            )
+        except (RuntimeError, TypeError):
+            optimizer = torch.optim.AdamW(
+                param_groups,
+                eps=adam_eps,
+                weight_decay=weight_decay,
+            )
 
         # run optimizer empty step to initialize optimizer.state
         # to avoid KeyError during get_state_dict/set_state_dict
@@ -471,17 +577,101 @@ class FSDPModelManager:
         warmup_optimizer_state(optimizer)
         return optimizer
 
-    def build_grad_scaler(self, enabled: bool) -> GradScaler:
+    def build_optimizers(
+        self,
+        model: Union[nn.Module, FSDPModule, FSDP],
+        main_optim_config: DictConfig,
+        param_filters: dict[str, list[str]],
+        filtered_optim_config: dict[str, DictConfig],
+    ):
+        main_betas = (
+            main_optim_config.get("adam_beta1", 0.9),
+            main_optim_config.get("adam_beta2", 0.999),
+        )
+        main_adam_eps = main_optim_config.get("adam_eps", 1e-8)
+        main_lr = main_optim_config.lr
+
+        filtered_optim_batas_map = {}
+        filtered_optim_adam_eps_map = {}
+        filtered_optim_lr_map = {}
+        for key, config in filtered_optim_config.items():
+            filtered_optim_batas_map[key] = (
+                config.get("adam_beta1", 0.9),
+                config.get("adam_beta2", 0.999),
+            )
+            filtered_optim_adam_eps_map[key] = config.get("adam_eps", 1e-8)
+            filtered_optim_lr_map[key] = config.lr
+
+        main_optim_params = []
+
+        filtered_params_dict = {}
+        for key in param_filters.keys():
+            filtered_params_dict[key] = []
+
+        # ISSUE: currently the net weight still bind with the actor.
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+
+            is_matched = False
+            for key, filters in param_filters.items():
+                for f in filters:
+                    if f in name:
+                        filtered_params_dict[key].append(param)
+                        is_matched = True
+                        break
+                if is_matched:
+                    break
+
+            if is_matched:
+                continue
+
+            main_optim_params.append(param)
+
+        assert len(main_optim_params) > 0
+        main_optimizer = torch.optim.Adam(
+            [
+                {
+                    "params": main_optim_params,
+                    "lr": main_lr,
+                    "betas": main_betas,
+                    "eps": main_adam_eps,
+                },
+            ]
+        )
+        optimizers = [main_optimizer]
+
+        for key, params in filtered_params_dict.items():
+            assert len(params) > 0, (
+                f"optimer {key=} is not match any params, with {param_filters[key]=}"
+            )
+        for key, params in filtered_params_dict.items():
+            optimizers.append(
+                torch.optim.Adam(
+                    [
+                        {
+                            "params": params,
+                            "lr": filtered_optim_lr_map[key],
+                            "betas": filtered_optim_batas_map[key],
+                            "eps": filtered_optim_adam_eps_map[key],
+                        },
+                    ]
+                )
+            )
+        return optimizers
+
+    def build_grad_scaler(self, enabled: bool, **kwargs) -> ShardedGradScaler:
         """
         Build the gradient scaler based on the configuration.
 
         Args:
             enabled (bool): Whether to enable gradient scaling.
+            kwargs: Optional parameters for ShardedGradScaler.
 
         Returns:
-            GradScaler: The gradient scaler.
+            ShardedGradScaler: The gradient scaler.
         """
-        return GradScaler(enabled=enabled)
+        return ShardedGradScaler(enabled=enabled, **kwargs)
 
     def before_micro_batch(
         self, model: Union[FSDP, FSDPModule], is_last_micro_batch: bool
@@ -506,3 +696,36 @@ class FSDPModelManager:
         return self._strategy.before_micro_batch(
             model=model, is_last_micro_batch=is_last_micro_batch
         )
+
+    def divide_model_to_bucket(self, state_dict, agent_and_has_visual=False):
+        bucket_capacity = self.bucket_capacity
+        model_bucket_list = []
+        current_capacity = 0
+        model_bucket = {}
+        for key, val in state_dict.items():
+            name = key
+            if "_extra_state" in name:
+                continue
+            if agent_and_has_visual:
+                # for agent, we use sglang backend so the name mapping is needed
+                if name.startswith("model.language_model."):
+                    name = "model." + name[21:]
+
+            model_bucket[name] = val
+            if isinstance(val, DTensor):
+                current_capacity += (
+                    val.numel()
+                    * val.element_size()
+                    * torch.distributed.get_world_size()
+                )
+            else:
+                current_capacity += val.numel() * val.element_size()
+
+            if current_capacity >= bucket_capacity:
+                model_bucket_list.append(model_bucket)
+                current_capacity = 0
+                model_bucket = {}
+
+        if len(model_bucket) > 0:
+            model_bucket_list.append(model_bucket)
+        return model_bucket_list

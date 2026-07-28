@@ -12,8 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import types
+from unittest import mock
+
 import pytest
-import torch
 
 from rlinf.scheduler import (
     Cluster,
@@ -22,6 +25,17 @@ from rlinf.scheduler import (
     Worker,
     WorkerAddress,
 )
+from rlinf.scheduler.manager.coll_manager import CollectiveManager
+from rlinf.scheduler.manager.manager import Manager
+
+
+def accelerator_is_available():
+    """Return whether the Worker accelerator backend is available."""
+    return (
+        Worker.torch_platform is not None
+        and hasattr(Worker.torch_platform, "is_available")
+        and Worker.torch_platform.is_available()
+    )
 
 
 # Fixture to provide a ClusterResource instance for the test session
@@ -79,7 +93,7 @@ class TestClusterResource:
     def test_cluster_initialization(self, cluster: Cluster):
         """Verify that the cluster is initialized with correct properties."""
         assert cluster._num_nodes == 1
-        if torch.cuda.is_available():
+        if accelerator_is_available():
             assert cluster.num_accelerators >= 1
 
 
@@ -94,12 +108,32 @@ class TestWorkerAddress:
         assert addr.get_name() == "MyWorkerGroup:5"
 
 
+class TestManagerNamespace:
+    """Tests for manager namespace propagation."""
+
+    def test_manager_runtime_env_vars_include_cluster_namespace(self):
+        """Verify manager runtime env always includes the cluster namespace."""
+        with mock.patch.object(Cluster, "NAMESPACE", "test-namespace"):
+            runtime_env = Manager.get_runtime_env_vars()
+
+        assert runtime_env["CLUSTER_NAMESPACE"] == "test-namespace"
+
+    def test_sync_cluster_namespace_from_env(self):
+        """Verify manager syncs the cluster namespace from its runtime env."""
+        with mock.patch.object(Cluster, "NAMESPACE", "original-namespace"):
+            with mock.patch.dict(
+                os.environ, {"CLUSTER_NAMESPACE": "env-namespace"}, clear=False
+            ):
+                CollectiveManager()
+                assert Cluster.NAMESPACE == "env-namespace"
+
+
 class TestWorkerGroup:
     """Tests for the WorkerGroup class and its interactions."""
 
     def test_worker_group_creation(self, cluster: Cluster):
         """Verify that a WorkerGroup can be created successfully."""
-        if torch.cuda.is_available():
+        if accelerator_is_available():
             num_workers = cluster.num_accelerators
         else:
             num_workers = 1
@@ -118,7 +152,7 @@ class TestWorkerGroup:
 
     def test_execute_on_all_workers(self, cluster: Cluster):
         """Test calling a method on all workers in a group."""
-        if torch.cuda.is_available():
+        if accelerator_is_available():
             num_workers = cluster.num_accelerators
         else:
             num_workers = 1
@@ -135,7 +169,7 @@ class TestWorkerGroup:
 
     def test_execute_on_specific_ranks(self, cluster: Cluster):
         """Test calling a method on a subset of workers in a group."""
-        if torch.cuda.is_available():
+        if accelerator_is_available():
             placement = PackedPlacementStrategy(0, cluster.num_accelerators - 1)
         else:
             placement = NodePlacementStrategy([0] * 8)
@@ -155,7 +189,7 @@ class TestWorkerGroup:
 
     def test_multiple_worker_groups(self, cluster: Cluster):
         """Test the creation and operation of multiple independent worker groups."""
-        if torch.cuda.is_available():
+        if accelerator_is_available():
             num_workers = cluster.num_accelerators
         else:
             num_workers = 1
@@ -175,6 +209,35 @@ class TestWorkerGroup:
         results2 = group2.sum_with_rank(200).wait()
         assert len(results2) == num_workers
         assert sorted(results2) == [200 + i for i in range(num_workers)]
+
+
+class TestLoadUserExtensions:
+    """Tests for the Worker._load_user_extensions method."""
+
+    def _create_mock_worker(self):
+        """Create a minimal mock worker instance for testing _load_user_extensions."""
+        worker = object.__new__(Worker)
+        return worker
+
+    def test_no_action_when_env_var_not_set(self):
+        """Verify no action is taken when RLINF_EXT_MODULE is not set."""
+        worker = self._create_mock_worker()
+        os.environ.pop("RLINF_EXT_MODULE", None)
+
+        with mock.patch("importlib.import_module") as mock_import:
+            worker._load_user_extensions()
+            mock_import.assert_not_called()
+
+    def test_extension_module_loaded_and_register_called(self):
+        """Verify extension module is loaded and register() is called."""
+        worker = self._create_mock_worker()
+        mock_module = types.ModuleType("mock_ext_module")
+        mock_module.register = mock.Mock()
+
+        with mock.patch.dict(os.environ, {"RLINF_EXT_MODULE": "mock_ext_module"}):
+            with mock.patch("importlib.import_module", return_value=mock_module):
+                worker._load_user_extensions()
+                mock_module.register.assert_called_once()
 
 
 if __name__ == "__main__":

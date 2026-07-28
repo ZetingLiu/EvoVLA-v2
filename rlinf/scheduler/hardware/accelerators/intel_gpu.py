@@ -16,10 +16,21 @@
 # https://github.com/ray-project/ray/blob/161849364a784442cc659fb9780f1a6adee85fce/python/ray/_private/accelerators/intel_gpu.py
 
 import os
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Optional
 
 from ray._private.accelerators.intel_gpu import IntelGPUAcceleratorManager
 
-from .accelerator import AcceleratorManager, AcceleratorType
+from .accelerator import AcceleratorManager, AcceleratorType, ProfileConfig
+
+if TYPE_CHECKING:
+    from ...collective import CollectiveGroupOptions
+
+
+@AcceleratorManager.register_profiling_config(AcceleratorType.INTEL_GPU)
+@dataclass
+class IntelGPUProfileConfig(ProfileConfig):
+    """Intel GPU profiling configuration."""
 
 
 @AcceleratorManager.register_manager(AcceleratorType.INTEL_GPU)
@@ -96,9 +107,25 @@ class IntelGPUManager(AcceleratorManager):
         """Get the PyTorch platform module."""
         import torch
 
-        return torch.xpu
+        xpu_platform = torch.xpu
+
+        # Some PyTorch/IPEX versions do not expose ipc_collect on torch.xpu.
+        # Keep parity with CUDA call-sites by providing a no-op fallback.
+        if not hasattr(xpu_platform, "ipc_collect"):
+
+            def _ipc_collect_noop() -> None:
+                return None
+
+            setattr(xpu_platform, "ipc_collect", _ipc_collect_noop)
+
+        return xpu_platform
 
     @staticmethod
     def get_device_type() -> str:
         """Get the device type."""
         return "xpu"
+
+    @staticmethod
+    def get_accel_pg_options(options: Optional["CollectiveGroupOptions"]):
+        """Get the accelerator CCL process group options."""
+        return None

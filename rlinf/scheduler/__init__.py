@@ -14,8 +14,18 @@
 
 from .channel import Channel, ChannelWorker, WeightedItem
 from .cluster import Cluster, ClusterConfig
-from .hardware import AcceleratorType, AcceleratorUtil, FrankaHWInfo, HardwareInfo
-from .manager import WorkerInfo
+from .collective import CollectiveGroupOptions
+from .hardware import (
+    AcceleratorType,
+    AcceleratorUtil,
+    DOSW1HWInfo,
+    DualFrankaHWInfo,
+    FrankaHWInfo,
+    GimArmHWInfo,
+    HardwareInfo,
+    Turtle2HWInfo,
+)
+from .manager import Tracer, WorkerInfo
 from .placement import (
     ComponentPlacement,
     FlexiblePlacementStrategy,
@@ -24,12 +34,31 @@ from .placement import (
     PlacementStrategy,
 )
 from .worker import Worker, WorkerAddress, WorkerGroupFuncResult
+from .worker.routing import (
+    CommMapper,
+    build_recv_plan,
+    build_route_channel_key,
+    build_send_key,
+    build_send_plan,
+    decoupled_build_recv_plan,
+    get_batch_size,
+    get_group_world_size,
+    infer_batch_size,
+    merge_batches,
+    split_batch,
+    split_channel_message,
+)
 
 __all__ = [
     "AcceleratorUtil",
     "AcceleratorType",
     "HardwareInfo",
+    "DOSW1HWInfo",
+    "DualFrankaHWInfo",
     "FrankaHWInfo",
+    "GimArmHWInfo",
+    "Turtle2HWInfo",
+    "CollectiveGroupOptions",
     "Cluster",
     "ClusterConfig",
     "ComponentPlacement",
@@ -40,8 +69,21 @@ __all__ = [
     "Worker",
     "WorkerAddress",
     "WorkerGroupFuncResult",
+    "CommMapper",
+    "split_channel_message",
+    "build_send_plan",
+    "build_send_key",
+    "build_recv_plan",
+    "build_route_channel_key",
+    "decoupled_build_recv_plan",
+    "get_batch_size",
+    "get_group_world_size",
+    "infer_batch_size",
+    "split_batch",
+    "merge_batches",
     "WorkerInfo",
     "Channel",
     "ChannelWorker",
     "WeightedItem",
+    "Tracer",
 ]

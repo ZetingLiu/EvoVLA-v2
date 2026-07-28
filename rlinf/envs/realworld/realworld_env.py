@@ -1,4 +1,4 @@
-# Copyright 2025 The RLinf Authors.
+# Copyright 2026 The RLinf Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@ import os
 import pathlib
 import time
 from functools import partial
-from typing import Optional, OrderedDict
+from typing import OrderedDict
 
 import gymnasium as gym
 import numpy as np
@@ -26,19 +26,8 @@ import torch
 from filelock import FileLock
 from omegaconf import OmegaConf
 
-from rlinf.envs.realworld.common.wrappers import (
-    GripperCloseEnv,
-    Quat2EulerWrapper,
-    RelativeFrame,
-    SpacemouseIntervention,
-)
 from rlinf.envs.realworld.venv import NoAutoResetSyncVectorEnv
-from rlinf.envs.utils import (
-    put_info_on_image,
-    save_rollout_video,
-    tile_images,
-    to_tensor,
-)
+from rlinf.envs.utils import to_tensor
 from rlinf.scheduler import WorkerInfo
 
 
@@ -50,7 +39,7 @@ class RealWorldEnv(gym.Env):
 
         self.cfg = cfg
         self.override_cfg = OmegaConf.to_container(
-            cfg.get("override_cfg", {}), resolve=True
+            cfg.get("override_cfg", OmegaConf.create({})), resolve=True
         )
 
         self.video_cfg = cfg.video_cfg
@@ -64,6 +53,10 @@ class RealWorldEnv(gym.Env):
         self.ignore_terminations = cfg.ignore_terminations
         self.num_group = num_envs // cfg.group_size
         self.group_size = cfg.group_size
+        self.main_image_key = cfg.main_image_key
+        self.manual_episode_control_only = bool(
+            self.override_cfg.get("manual_episode_control_only", False)
+        )
 
         self._init_env()
 
@@ -71,9 +64,6 @@ class RealWorldEnv(gym.Env):
         self._init_metrics()
         self._elapsed_steps = np.zeros(self.num_envs, dtype=np.int32)
         self._init_reset_state_ids()
-
-        self.video_cnt = 0
-        self.render_images = []
 
     def _create_env(self, env_idx: int):
         worker_info: WorkerInfo = self.worker_info
@@ -87,12 +77,8 @@ class RealWorldEnv(gym.Env):
             worker_info=worker_info,
             hardware_info=hardware_info,
             env_idx=env_idx,
+            env_cfg=self.cfg,
         )
-        env = GripperCloseEnv(env)
-        if not env.config.is_dummy and self.cfg.get("use_spacemouse", True):
-            env = SpacemouseIntervention(env)
-        env = RelativeFrame(env)
-        env = Quat2EulerWrapper(env)
         return env
 
     @staticmethod
@@ -125,7 +111,17 @@ class RealWorldEnv(gym.Env):
             for env_idx in range(self.num_envs)
         ]
         self.env = NoAutoResetSyncVectorEnv(env_fns)
-        self.task_descriptions = list(self.env.call("task_description"))
+        self.task_descriptions = list(
+            self.env.call("get_wrapper_attr", "task_description")
+        )
+
+    @property
+    def action_space(self):
+        return self.env.action_space
+
+    @property
+    def observation_space(self):
+        return self.env.observation_space
 
     @property
     def total_num_group_envs(self):
@@ -172,22 +168,29 @@ class RealWorldEnv(gym.Env):
             self.intervened_once[:] = False
             self.intervened_steps[:] = 0
 
-    def _record_metrics(self, step_reward, terminations, infos):
+    def _record_metrics(
+        self,
+        step_reward,
+        terminations,
+        success_current_step,
+        intervene_current_step,
+        infos,
+    ):
         episode_info = {}
         self.returns += step_reward
-        self.success_once = self.success_once | terminations
-        if "intervene_action" in infos:
-            # TODO: not suitable for multiple envs
-            for env_id in range(self.num_envs):
-                if infos["intervene_action"][env_id] is not None:
-                    self.intervened_once[env_id] = True
-                    self.intervened_steps += 1
+        self.success_once = self.success_once | success_current_step
+        self.intervened_once = self.intervened_once | intervene_current_step
+        self.intervened_steps += intervene_current_step.astype(int)
+
         episode_info["success_once"] = self.success_once.copy()
         episode_info["return"] = self.returns.copy()
         episode_info["episode_len"] = self.elapsed_steps.copy()
         episode_info["reward"] = episode_info["return"] / episode_info["episode_len"]
         episode_info["intervened_once"] = self.intervened_once
         episode_info["intervened_steps"] = self.intervened_steps
+        episode_info["success_no_intervened"] = self.success_once.copy() & (
+            ~self.intervened_once
+        )
         infos["episode"] = to_tensor(episode_info)
         return infos
 
@@ -208,18 +211,18 @@ class RealWorldEnv(gym.Env):
         """
         obs = {}
 
-        # Process states
-        full_states = []
-        raw_states = OrderedDict(sorted(raw_obs["state"].items()))
-        for value in raw_states.values():
-            full_states.append(value)
-        full_states = np.concatenate(full_states, axis=-1)
+        state = raw_obs["state"]
+        full_states = np.concatenate([state[k] for k in sorted(state)], axis=-1)
         obs["states"] = full_states
 
-        # Process images
-        obs["main_images"] = raw_obs["frames"]["wrist_1"]
-        raw_images = OrderedDict(sorted(raw_obs["frames"].items()))
-        raw_images.pop("wrist_1")
+        frames = raw_obs["frames"]
+        if self.main_image_key not in frames:
+            raise KeyError(
+                f"main_image_key {self.main_image_key!r} not in {list(frames)}"
+            )
+        obs["main_images"] = frames[self.main_image_key]
+        raw_images = OrderedDict(sorted(frames.items()))
+        raw_images.pop(self.main_image_key)
 
         if raw_images:
             obs["extra_view_images"] = np.stack(list(raw_images.values()), axis=1)
@@ -234,35 +237,46 @@ class RealWorldEnv(gym.Env):
 
         self._elapsed_steps += 1
         raw_obs, _reward, terminations, truncations, infos = self.env.step(actions)
-        truncations = self.elapsed_steps >= self.cfg.max_episode_steps
+        # max_episode_steps: null → external wrapper owns episode end.
+        if self.cfg.max_episode_steps is None:
+            timeout_truncations = np.zeros_like(truncations, dtype=bool)
+        else:
+            timeout_truncations = self.elapsed_steps >= self.cfg.max_episode_steps
+        if not self.manual_episode_control_only:
+            truncations = timeout_truncations
 
         obs = self._wrap_obs(raw_obs)
-
         step_reward = self._calc_step_reward(_reward)
+        success_current_step = np.isclose(step_reward, 1.0)
+        intervene_flag = np.zeros(self.num_envs, dtype=bool)
+        if "intervene_action" in infos:
+            for env_id in range(self.num_envs):
+                if infos["intervene_action"][env_id] is not None:
+                    intervene_flag[env_id] = True
 
-        if self.video_cfg.save_video:
-            plot_infos = {
-                "rewards": step_reward,
-                "terminations": terminations,
-                "steps": self._elapsed_steps,
-            }
-            self.add_new_frames(raw_obs["frames"], plot_infos)
-
-        infos = self._record_metrics(step_reward, terminations, infos)
+        infos = self._record_metrics(
+            step_reward,
+            terminations,
+            success_current_step,
+            intervene_flag,
+            infos,
+        )
         if self.ignore_terminations:
             infos["episode"]["success_at_end"] = to_tensor(terminations)
             terminations[:] = False
 
         intervene_action = np.zeros_like(actions)
-        intervene_flag = np.zeros((self.num_envs,), dtype=bool)
         if "intervene_action" in infos:
             for env_id in range(self.num_envs):
                 env_intervene_action = infos["intervene_action"][env_id]
                 if env_intervene_action is not None:
                     intervene_action[env_id] = env_intervene_action.copy()
-                    intervene_flag[env_id] = True
         infos["intervene_action"] = to_tensor(intervene_action)
         infos["intervene_flag"] = to_tensor(intervene_flag)
+        if "rlt_switch_flags" in infos:
+            infos["rlt_switch_flags"] = to_tensor(
+                np.asarray(infos["rlt_switch_flags"], dtype=bool)
+            )
 
         dones = terminations | truncations
         _auto_reset = auto_reset and self.auto_reset
@@ -279,6 +293,8 @@ class RealWorldEnv(gym.Env):
     def chunk_step(self, chunk_actions):
         # chunk_actions: [num_envs, chunk_step, action_dim]
         chunk_size = chunk_actions.shape[1]
+        obs_list = []
+        infos_list = []
 
         chunk_rewards = []
 
@@ -287,14 +303,19 @@ class RealWorldEnv(gym.Env):
 
         raw_chunk_intervene_actions = []
         raw_chunk_intervene_flag = []
+        raw_chunk_rlt_switch_flags = []
         for i in range(chunk_size):
             actions = chunk_actions[:, i]
             extracted_obs, step_reward, terminations, truncations, infos = self.step(
                 actions, auto_reset=False
             )
+            obs_list.append(extracted_obs)
+            infos_list.append(infos)
             if "intervene_action" in infos:
                 raw_chunk_intervene_actions.append(infos["intervene_action"])
                 raw_chunk_intervene_flag.append(infos["intervene_flag"])
+            if "rlt_switch_flags" in infos:
+                raw_chunk_rlt_switch_flags.append(infos["rlt_switch_flags"])
 
             chunk_rewards.append(step_reward)
             raw_chunk_terminations.append(terminations)
@@ -312,14 +333,22 @@ class RealWorldEnv(gym.Env):
         past_truncations = raw_chunk_truncations.any(dim=1)
         past_dones = torch.logical_or(past_terminations, past_truncations)
 
-        infos["intervene_action"] = torch.stack(
-            raw_chunk_intervene_actions, dim=1
-        ).reshape(self.num_envs, -1)
-        infos["intervene_flag"] = torch.stack(raw_chunk_intervene_flag, dim=1)
+        infos_last = infos_list[-1] if infos_list else {}
+        if raw_chunk_intervene_actions:
+            infos_last["intervene_action"] = torch.stack(
+                raw_chunk_intervene_actions, dim=1
+            ).reshape(self.num_envs, -1)
+            infos_last["intervene_flag"] = torch.stack(raw_chunk_intervene_flag, dim=1)
+            infos_list[-1] = infos_last
+        if raw_chunk_rlt_switch_flags:
+            infos_last["rlt_switch_flags"] = torch.stack(
+                raw_chunk_rlt_switch_flags, dim=1
+            )
+            infos_list[-1] = infos_last
 
         if past_dones.any() and self.auto_reset:
-            extracted_obs, infos = self._handle_auto_reset(
-                past_dones.cpu().numpy(), extracted_obs, infos
+            obs_list[-1], infos_list[-1] = self._handle_auto_reset(
+                past_dones.cpu().numpy(), obs_list[-1], infos_list[-1]
             )
 
         if self.auto_reset or self.ignore_terminations:
@@ -332,11 +361,11 @@ class RealWorldEnv(gym.Env):
             chunk_terminations = raw_chunk_terminations.clone()
             chunk_truncations = raw_chunk_truncations.clone()
         return (
-            extracted_obs,
+            obs_list,
             chunk_rewards,
             chunk_terminations,
             chunk_truncations,
-            infos,
+            infos_list,
         )
 
     def _handle_auto_reset(self, dones, _final_obs, infos):
@@ -345,9 +374,11 @@ class RealWorldEnv(gym.Env):
         final_info = copy.deepcopy(infos)
         obs, infos = self.reset(
             env_idx=env_idx,
-            reset_state_ids=self.reset_state_ids[env_idx]
-            if self.use_fixed_reset_state_ids
-            else None,
+            reset_state_ids=(
+                self.reset_state_ids[env_idx]
+                if self.use_fixed_reset_state_ids
+                else None
+            ),
         )
         # gymnasium calls it final observation but it really is just o_{t+1} or the true next observation
         infos["final_observation"] = final_obs
@@ -381,35 +412,3 @@ class RealWorldEnv(gym.Env):
         self.reset_state_ids = reset_state_ids.repeat_interleave(
             repeats=self.group_size
         )
-
-    def add_new_frames(self, image_obs, plot_infos):
-        images = []
-        for image in image_obs.values():
-            images.append(image)
-
-        full_image = tile_images(images)
-
-        for env_id in range(self.num_envs):
-            info_item = {
-                k: v if np.size(v) == 1 else v[env_id] for k, v in plot_infos.items()
-            }
-            full_image[env_id] = put_info_on_image(full_image[env_id], info_item)
-        if len(full_image.shape) > 3:
-            if len(full_image) == 1:
-                full_image = full_image[0]
-            else:
-                full_image = tile_images(full_image, nrows=int(np.sqrt(self.num_envs)))
-        self.render_images.append(full_image)
-
-    def flush_video(self, video_sub_dir: Optional[str] = None):
-        output_dir = os.path.join(self.video_cfg.video_base_dir, f"seed_{self.seed}")
-        if video_sub_dir is not None:
-            output_dir = os.path.join(output_dir, f"{video_sub_dir}")
-        save_rollout_video(
-            self.render_images,
-            output_dir=output_dir,
-            video_name=f"{self.video_cnt}",
-            fps=10,
-        )
-        self.video_cnt += 1
-        self.render_images = []

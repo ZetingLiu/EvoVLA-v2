@@ -3,6 +3,7 @@ env_type: maniskill
 total_num_envs: null
 
 wrap_obs_mode: simple
+use_full_state: False
 auto_reset: False
 ignore_terminations: False
 use_rel_reward: False
@@ -18,6 +19,8 @@ video_cfg:
   info_on_video: True
   video_base_dir: ${runner.logger.log_path}/video/train
 
+enable_offload: False
+
 init_params:
   id: "PickCube-v1"
   num_envs: null # will be set in ManiSkillEnv init
@@ -27,7 +30,7 @@ init_params:
   sim_config:
     sim_freq: 100
     control_freq: 20
-  max_episode_steps: ${env.train.max_episode_steps} # max episode steps for truncation
+  max_episode_steps: ${..max_episode_steps} # max episode steps for truncation
   sensor_configs:
     shader_pack: "default"
   render_mode: all

@@ -64,6 +64,9 @@ class NodeInfo:
     hardware_resources: list[HardwareResource] = field(default_factory=list)
     """List of hardware resources available on the node."""
 
+    profiler_backends: list[str] = field(default_factory=list)
+    """Profiling backends whose required tools are available on this node (e.g. ``["nsight"]``)."""
+
     @property
     def num_accelerators(self) -> int:
         """Get the number of accelerators on the node."""
@@ -78,6 +81,14 @@ class NodeInfo:
                     resource.infos[0].model
                 )
         return AcceleratorType.NO_ACCEL.value
+
+    @property
+    def accelerator_model(self) -> str:
+        """Get the model of accelerators on the node."""
+        for resource in self.hardware_resources:
+            if resource.type == Accelerator.HW_TYPE and resource.count > 0:
+                return resource.infos[0].model
+        return ""
 
     def get_hw_resource_count(self, hw_type: Optional[str]) -> int:
         """Get the count of a specific hardware resource type."""
@@ -382,7 +393,9 @@ class NodeProbe:
         2. Environment variables set between ray start and RLinf initialization on the head node (usually via bash scripts). These env vars are likely set by users intended to configure all nodes in the cluster.
         3. The env_vars field in the ClusterConfig, which are set in yaml config files to configure each node in the cluster. This is set in Cluster.allocate.
         """
-        # Overwrite the the head node's python interpreter path as the current interpreter unless specified in the cluster config
+        from .cluster import Cluster
+
+        # Overwrite the head node's python interpreter path as the current interpreter unless specified in the cluster config
         self.head_node.python_interpreter_path = sys.executable
 
         # First find env vars set between ray start and RLinf initialization on the head node
@@ -401,7 +414,11 @@ class NodeProbe:
             node.env_vars = node.default_env_vars.copy()
 
             # Update with modified env vars on the head node
-            node.env_vars.update(modified_env_vars)
+            node.env_vars = Cluster.merge_worker_env_vars(
+                base_env_vars=node.env_vars,
+                incoming_env_vars=modified_env_vars,
+                mode=Cluster.get_path_env_merge_mode(node.env_vars),
+            )
 
     def _sort_nodes(self, cluster_num_nodes: int):
         """Sort the node info list by node rank if available, otherwise by accelerator type and IP."""
@@ -525,6 +542,15 @@ class _RemoteNodeProbe:
                     f"Python interpreter path {path} does not exist on node with node rank {node_rank}. Please check your cluster configuration."
                 )
 
+        # Discover which profiling backends have their required tools available on this node.
+        from ..hardware.accelerators.accelerator import AcceleratorManager
+
+        profiler_backends = [
+            backend_name
+            for backend_name, backend_cls in AcceleratorManager.profile_backend_register.items()
+            if backend_cls().check()
+        ]
+
         self._node_info = NodeInfo(
             node_labels=node_labels,
             node_rank=node_rank,
@@ -535,6 +561,7 @@ class _RemoteNodeProbe:
             default_env_vars=os.environ.copy(),
             env_vars=os.environ.copy(),
             hardware_resources=hardware_resources,
+            profiler_backends=profiler_backends,
         )
 
     def get_node_info(self):

@@ -1,6 +1,7 @@
 #!/bin/bash
 
-# Configure ROS apt source for the current Ubuntu version using USTC mirror.
+# Configure ROS apt source for the current Ubuntu version.
+USE_MIRRORS=${USE_MIRRORS:-0}
 
 # Check if apt is available
 if ! command -v apt-get &> /dev/null; then
@@ -42,7 +43,11 @@ if [ -z "$ubuntu_codename" ]; then
     exit 1
 fi
 
-ros_mirror="http://mirrors.ustc.edu.cn/ros/ubuntu"
+if [ "$USE_MIRRORS" -eq 1 ]; then
+    ros_mirror="http://mirrors.ustc.edu.cn/ros/ubuntu"
+else
+    ros_mirror="http://packages.ros.org/ros/ubuntu"
+fi
 test_url="${ros_mirror}/dists/${ubuntu_codename}/"
 
 # Check whether the ROS mirror provides packages for this Ubuntu codename
@@ -81,12 +86,14 @@ if [ "$ubuntu_codename" != "focal" ]; then
 fi
 
 # libfranka dependencies
-sudo apt-get install -y libpoco-dev libeigen3-dev libfmt-dev
+sudo apt-get install -y libpoco-dev libeigen3-dev libfmt-dev libhidapi-dev
 sudo apt-get install -y lsb-release curl
 sudo mkdir -p /etc/apt/keyrings
 curl -fsSL http://robotpkg.openrobots.org/packages/debian/robotpkg.asc | sudo tee /etc/apt/keyrings/robotpkg.asc
 echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/robotpkg.asc] http://robotpkg.openrobots.org/packages/debian/pub $ubuntu_codename robotpkg" | sudo tee /etc/apt/sources.list.d/robotpkg.list
 sudo apt-get update
+sudo apt-get install -y robotpkg-simde=0.8.0 
+sudo apt-get install -y robotpkg-casadi=3.6.7
 sudo apt-get install -y robotpkg-pinocchio
 
 # franka_ros dependencies
@@ -98,5 +105,8 @@ sudo apt-get install -y --no-install-recommends \
     ros-noetic-gazebo-ros-control \
     ros-noetic-urdfdom-py \
     ros-noetic-tf-conversions \
-    ros-noetic-kdl-parser
+    ros-noetic-kdl-parser \
+    ros-noetic-xacro \
+    ros-noetic-robot-state-publisher \
+    ros-noetic-joint-state-publisher
 

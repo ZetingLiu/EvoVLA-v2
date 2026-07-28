@@ -50,12 +50,11 @@ class FrankaEEOutputs(transforms.DataTransformFn):
     For your own dataset, you can copy this class and modify the action dimension based on the comments below.
     """
 
-    # Whether to train actions using rotation_6d or not.
-    action_train_with_rotation_6d: bool = False
+    output_action_dim: int  # default output action dim is 7 (xyz + rpy + gripper)
 
     def __call__(self, data: dict) -> dict:
         return {
-            "actions": np.asarray(data["actions"][:, :7])
+            "actions": np.asarray(data["actions"][:, : self.output_action_dim])
         }  # use abs actions [x,y,z,rx,ry,rz,gripper] for Franka
 
 
@@ -75,26 +74,22 @@ class FrankaEEInputs(transforms.DataTransformFn):
     # Determines which model will be used.
     # Do not change this for your own dataset.
     model_type: _model.ModelType = _model.ModelType.PI0
-
-    # Whether to train actions using rotation_6d or not.
-    action_train_with_rotation_6d: bool = False
+    pad_state: bool = True
 
     def __call__(self, data: dict) -> dict:
-        assert data["observation/state"].shape == (7,), (
-            f"Expected state shape (7,), got {data['observation/state'].shape}"
-        )
         if isinstance(data["observation/state"], np.ndarray):
             data["observation/state"] = torch.from_numpy(
                 data["observation/state"]
             ).float()
 
         state = data["observation/state"]
-        state = transforms.pad_to_dim(state, self.action_dim)
+        if self.pad_state:
+            state = transforms.pad_to_dim(state, self.action_dim)
 
         base_image = _parse_image(data["observation/image"])
 
         # We only mask padding for pi0 model, not pi0-FAST.
-        if self.model_type == _model.ModelType.PI0:
+        if self.model_type in (_model.ModelType.PI0, _model.ModelType.PI05):
             names = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
             images = (
                 base_image,
@@ -123,9 +118,6 @@ class FrankaEEInputs(transforms.DataTransformFn):
         # Pad actions to the model action dimension. Keep this for your own dataset.
         # Actions are only available during training.
         if "actions" in data:
-            assert len(data["actions"].shape) == 2 and data["actions"].shape[-1] == 7, (
-                f"Expected actions shape (N, 7), got {data['actions'].shape}"
-            )
             actions = transforms.pad_to_dim(data["actions"], self.action_dim)
             inputs["actions"] = actions
 

@@ -16,10 +16,21 @@
 # https://github.com/ray-project/ray/blob/161849364a784442cc659fb9780f1a6adee85fce/python/ray/_private/accelerators/npu.py
 
 import os
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Optional
 
 from ray._private.accelerators.npu import NPUAcceleratorManager
 
-from .accelerator import AcceleratorManager, AcceleratorType
+from .accelerator import AcceleratorManager, AcceleratorType, ProfileConfig
+
+if TYPE_CHECKING:
+    from ...collective import CollectiveGroupOptions
+
+
+@AcceleratorManager.register_profiling_config(AcceleratorType.NPU)
+@dataclass
+class AscendNPUProfileConfig(ProfileConfig):
+    """Ascend NPU profiling configuration."""
 
 
 @AcceleratorManager.register_manager(AcceleratorType.NPU)
@@ -96,9 +107,21 @@ class AscendNPUManager(AcceleratorManager):
         """Get the PyTorch platform module."""
         import torch
 
+        # torch.cuda.ipc_collect() exists for inter-process CUDA tensor cleanup;
+        # torch_npu doesn't expose it (NPU has no equivalent IPC mechanism).
+        # Scheduler call sites (collective_group, utils.utils) invoke
+        # `Worker.torch_platform.ipc_collect()` unconditionally, so attach a
+        # no-op when missing instead of guarding every call site.
+        if not hasattr(torch.npu, "ipc_collect"):
+            torch.npu.ipc_collect = lambda: None
         return torch.npu
 
     @staticmethod
     def get_device_type() -> str:
         """Get the device type."""
         return "npu"
+
+    @staticmethod
+    def get_accel_pg_options(options: Optional["CollectiveGroupOptions"]):
+        """Get the accelerator CCL process group options."""
+        return None

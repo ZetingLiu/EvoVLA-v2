@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import ctypes
 import functools
 import inspect
 import logging
@@ -21,24 +22,26 @@ import sys
 import threading
 import time
 import traceback
+import warnings
 from contextlib import contextmanager
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Callable,
-    Optional,
-    TypeVar,
-)
+from typing import TYPE_CHECKING, Any, Callable, Optional, TypeVar
 
 import ray
+import ray.util.state
 import torch
-from omegaconf import OmegaConf
 
-from ..cluster import Cluster, ClusterEnvVar
+from ..cluster import (
+    Cluster,
+    ClusterEnvVar,
+    load_user_extension_module,
+    without_http_proxies,
+)
 from ..hardware import AcceleratorType, AcceleratorUtil, HardwareInfo
 from ..manager import WorkerAddress
+from .routing import split_channel_message
 
 if TYPE_CHECKING:
+    from ..collective import CollectiveGroupOptions
     from ..manager import WorkerInfo
     from .worker_group import WorkerGroup
 
@@ -313,8 +316,9 @@ class Worker(metaclass=WorkerMeta):
     logging.basicConfig()
     logger = logging.getLogger(Cluster.SYS_NAME)
     logger.setLevel(Cluster.LOGGING_LEVEL)
-    torch_platform = torch.cuda
-    torch_device_type = "cuda"
+    accelerator_type = AcceleratorUtil.get_accelerator_type()
+    torch_platform = AcceleratorUtil.get_torch_platform(accelerator_type)
+    torch_device_type = AcceleratorUtil.get_device_type(accelerator_type)
 
     def __new__(cls, *args, **kwargs):
         """Create a new instance of the Worker class."""
@@ -330,6 +334,7 @@ class Worker(metaclass=WorkerMeta):
             # Ray new the class in main thread but call __init__ in worker thread if it's an Actor with async functions
             # Since signal handlers must be registered in main thread, we call the registration in __new__
             instance._register_signal_handlers()
+            instance._enable_ptrace()
 
         return instance
 
@@ -348,22 +353,38 @@ class Worker(metaclass=WorkerMeta):
         self._accelerator_type = AcceleratorType(
             os.environ.get("ACCELERATOR_TYPE", str(AcceleratorType.NO_ACCEL.value))
         )
+        self._accelerator_model = os.environ.get("ACCELERATOR_MODEL", "")
         self._local_accelerator_rank = int(os.environ.get("LOCAL_ACCELERATOR_RANK", -1))
         self._node_local_rank = int(os.environ.get("NODE_LOCAL_RANK", -1))
         self._node_local_world_size = int(os.environ.get("NODE_LOCAL_WORLD_SIZE", -1))
+        Worker.accelerator_type = self._accelerator_type
         Worker.torch_device_type = AcceleratorUtil.get_device_type(
             self._accelerator_type
         )
         Worker.torch_platform = AcceleratorUtil.get_torch_platform(
             self._accelerator_type
         )
+        self.accelerator_type = Worker.accelerator_type
         self.torch_device_type = Worker.torch_device_type
         self.torch_platform = Worker.torch_platform
 
         self._actor = None
         self._has_initialized = False
         self._timer_metrics: dict[str, float] = {}
-        self._set_new_omegaconf_resolvers()
+
+        # Load user-provided extension modules (e.g., for registering custom envs/models)
+        self._load_user_extensions()
+
+    def _load_user_extensions(self):
+        """Load extension modules specified via EXT_MODULE environment variable.
+
+        This allows users to register custom environments, models, or other extensions
+        without patching.
+        The extension module should have a `register()` function that performs the necessary registrations.
+
+        The module's register() function will be called once per Worker process.
+        """
+        load_user_extension_module(logger=Worker.logger)
 
     def __init__(
         self,
@@ -518,7 +539,7 @@ class Worker(metaclass=WorkerMeta):
     @classmethod
     def create_group(
         cls: type[WorkerClsType], *args, **kwargs
-    ) -> "WorkerGroup[WorkerClsType]":
+    ) -> "WorkerGroup[WorkerClsType] | WorkerClsType":
         """Create a worker group with the class arguments.
 
         Args:
@@ -535,10 +556,12 @@ class Worker(metaclass=WorkerMeta):
         dst_group_name: str,
         dst_rank: int | list[int],
         async_op: bool = False,
+        options: Optional["CollectiveGroupOptions"] = None,
+        piggyback_payload: Optional[Any] = None,
     ):
         """Send an object to a specific worker address in the collective group.
 
-        The function is specially optimized for torch.Tensor, List of torch.Tensor, Dict of torch.Tensor, which go through NCCL when the contained tensors are on GPU. Otherwise, all communications go through GLOO.
+        The function is specially optimized for torch.Tensor, List of torch.Tensor, Dict of torch.Tensor, and dataclass containing torch.Tensor, which go through NCCL when the contained tensors are on GPU. Otherwise, all communications go through GLOO.
 
         .. note::
             Do not mix send with recv_tensor
@@ -560,17 +583,28 @@ class Worker(metaclass=WorkerMeta):
             dst_group_name (str): The name of the destination worker group.
             dst_rank (int | List[int]): The rank or list of ranks in the destination worker group to send the object to. For SPMD-like workers, this should be a single rank. For SPSD-like workers forked by parent workers, this can be a list of ranks that forms a path from the root worker to the target worker.
             async_op (bool): Whether to perform the operation asynchronously.
+            options (Optional[CollectiveGroupOptions]): The options for the collective group. The options will only take effect when two workers first communicate with each other, and will be ignored for subsequent communications. This option must match the options of the recv side.
+            piggyback_payload (Optional[Any]): The payload to piggyback on the send operation. This payload will be sent to the recv side and can be used to pass additional information to the recv side without disrupting the object's data structure, e.g., list/dict of tensors that are optimized for sending.
 
         Returns:
             Optional[AsyncWork]: An AsyncWork object if async_op is True, otherwise None.
 
         """
         dst_addr = WorkerAddress(dst_group_name, ranks=dst_rank)
-        group = self._get_p2p_collective_group(dst_addr)
-        return group.send(object=object, async_op=async_op)
+        group = self._get_collective_group(dst_addr)
+        return group.send(
+            object=object,
+            async_op=async_op,
+            options=options,
+            piggyback_payload=piggyback_payload,
+        )
 
     def recv(
-        self, src_group_name: str, src_rank: int | list[int], async_op: bool = False
+        self,
+        src_group_name: str,
+        src_rank: int | list[int],
+        async_op: bool = False,
+        options: Optional["CollectiveGroupOptions"] = None,
     ):
         """Out-of-place receive of an object from a specific worker address in the collective group.
 
@@ -587,14 +621,14 @@ class Worker(metaclass=WorkerMeta):
             async_op (bool): Whether to perform the operation asynchronously.
             src_group_name (str): The name of the source worker group.
             src_rank (int | List[int]): The rank or list of ranks in the source worker group to receive the object from. For SPMD-like workers, this should be a single rank. For SPSD-like workers forked by parent workers, this can be a list of ranks that forms a path from the root worker to the target worker.
+            options (Optional[CollectiveGroupOptions]): The options for the collective group. The options will only take effect when two workers first communicate with each other, and will be ignored for subsequent communications. This option must match the options of the send side.
 
         Returns:
-            AsyncWork | torch.Tensor | List[torch.Tensor] | Dict[str, torch.Tensor] | Any: An AsyncWork object if async_op is True, otherwise the received object.
-
+            AsyncWork | torch.Tensor | List[torch.Tensor] | Dict[str, torch.Tensor] | Any: An AsyncWork object if async_op is True, otherwise the received object. If the send side sends a piggyback payload, the received object will be a tuple of the received object and the piggyback payload.
         """
         src_addr = WorkerAddress(src_group_name, ranks=src_rank)
-        group = self._get_p2p_collective_group(src_addr)
-        return group.recv(async_op=async_op)
+        group = self._get_collective_group(src_addr)
+        return group.recv(async_op=async_op, options=options)
 
     def send_tensor(
         self,
@@ -602,6 +636,7 @@ class Worker(metaclass=WorkerMeta):
         dst_group_name: str,
         dst_rank: int | list[int],
         async_op: bool = False,
+        options: Optional["CollectiveGroupOptions"] = None,
     ):
         """Send a tensor to a specific worker address in the collective group. This function is optimized for sending a single tensor and does not introduce metadata communication overhead like send. But it needs to be paired with the in-place recv_tensor function which requires apriori knowledge of the tensor shape and dtype.
 
@@ -619,14 +654,15 @@ class Worker(metaclass=WorkerMeta):
             dst_group_name (str): The name of the destination worker group.
             dst_rank (int | List[int]): The rank or list of ranks in the destination worker group to send the tensor to. For SPMD-like workers, this should be a single rank. For SPSD-like workers forked by parent workers, this can be a list of ranks that forms a path from the root worker to the target worker.
             async_op (bool): Whether to perform the operation asynchronously.
+            options (Optional[CollectiveGroupOptions]): The options for the collective group. The options will only take effect when two workers first communicate with each other, and will be ignored for subsequent communications. This option must match the options of the send side.
 
         Returns:
             Optional[AsyncWork]: An AsyncWork object if async_op is True, otherwise None.
 
         """
         dst_addr = WorkerAddress(dst_group_name, ranks=dst_rank)
-        group = self._get_p2p_collective_group(dst_addr)
-        return group.send_tensor(tensor=tensor, async_op=async_op)
+        group = self._get_collective_group(dst_addr)
+        return group.send_tensor(tensor=tensor, async_op=async_op, options=options)
 
     def recv_tensor(
         self,
@@ -634,6 +670,7 @@ class Worker(metaclass=WorkerMeta):
         src_group_name: str,
         src_rank: int | list[int],
         async_op: bool = False,
+        options: Optional["CollectiveGroupOptions"] = None,
     ):
         """In-place receive of a tensor from a specific worker address in the collective group. This function is optimized for receiving a single tensor and does not introduce metadata communication overhead like recv. But it requires preallocation of the tensor with the correct shape and dtype.
 
@@ -651,29 +688,128 @@ class Worker(metaclass=WorkerMeta):
             src_group_name (str): The name of the source worker group.
             src_rank (int | List[int]): The rank or list of ranks in the source worker group to receive the tensor from. For SPMD-like workers, this should be a single rank. For SPSD-like workers forked by parent workers, this can be a list of ranks that forms a path from the root worker to the target worker.
             async_op (bool): Whether to perform the operation asynchronously.
+            options (Optional[CollectiveGroupOptions]): The options for the collective group. The options will only take effect when two workers first communicate with each other, and will be ignored for subsequent communications. This option must match the options of the send side.
 
         Returns:
             Optional[AsyncWork]: An AsyncWork object if async_op is True, otherwise None.
 
         """
         src_addr = WorkerAddress(src_group_name, ranks=src_rank)
-        group = self._get_p2p_collective_group(src_addr)
-        return group.recv_tensor(tensor=tensor, async_op=async_op)
+        group = self._get_collective_group(src_addr)
+        return group.recv_tensor(tensor=tensor, async_op=async_op, options=options)
+
+    def broadcast(
+        self,
+        object: Optional[Any] = None,
+        groups: Optional[
+            list[tuple[str, list[int] | list[tuple[int]] | tuple[int] | int]]
+        ] = None,
+        src: Optional[tuple[str, tuple[int] | int]] = None,
+        async_op: bool = False,
+        options: Optional["CollectiveGroupOptions"] = None,
+    ):
+        """Broadcast an object across workers in one or more groups.
+
+        The source is the first worker address in the expanded group list.
+        The index in the expanded list is the rank in the communication group.
+        All participating workers must call this method with identical arguments.
+
+        Args:
+            object (Any): The object to broadcast on the source worker. For non-src ranks, this is typically None.
+            groups: The participating groups with ranks. Each element must be a (group_name, ranks) tuple where ranks is either a single int (one worker of the rank), a list of ints (multiple workers of the same group), a tuple of ints (one worker of the rank path), or a list of tuples of ints (multiple workers of the rank paths of the same group).
+            src: The source group and rank. If not provided, the source will be the first worker address in the expanded group list.
+            async_op (bool): Whether to perform the operation asynchronously.
+            options (Optional[CollectiveGroupOptions]): The options for the collective group.
+
+        Returns:
+            AsyncWork | Any: An AsyncWork object if async_op is True, otherwise the
+            broadcast object.
+        """
+        if groups is None:
+            raise ValueError("groups must be provided with explicit ranks.")
+        if not isinstance(groups, list):
+            raise TypeError("groups must be a list of (group_name, rank) tuples.")
+        if len(groups) == 0:
+            raise ValueError("groups must contain at least one entry.")
+
+        worker_addresses: list[WorkerAddress] = []
+        for entry in groups:
+            if not isinstance(entry, tuple) or len(entry) != 2:
+                raise TypeError(
+                    "Each groups entry must be a (group_name, ranks) tuple."
+                )
+            group_name, ranks = entry
+            if not isinstance(group_name, str):
+                raise TypeError(
+                    f"group_name must be a string. But got {type(group_name)}."
+                )
+            if isinstance(ranks, list):
+                if len(ranks) == 0:
+                    raise ValueError("ranks list must not be empty.")
+                if not all(
+                    isinstance(rank, int) or isinstance(rank, tuple) for rank in ranks
+                ):
+                    raise TypeError(
+                        f"All ranks must be integers or tuples. But got {type(ranks)}."
+                    )
+                for rank in ranks:
+                    worker_addresses.append(WorkerAddress(group_name, ranks=rank))
+            elif isinstance(ranks, int) or isinstance(ranks, tuple):
+                worker_addresses.append(WorkerAddress(group_name, ranks=ranks))
+            else:
+                raise TypeError(
+                    f"ranks must be an int, tuple, list[int], list[tuple[int]]. But got {type(ranks)}."
+                )
+
+        if not worker_addresses:
+            return object
+
+        if self._worker_address not in worker_addresses:
+            raise ValueError(
+                f"Worker {self._worker_address.get_name()} is not part of the broadcast group."
+            )
+
+        # Get the src addr before sorting
+        if src is not None:
+            src_group_name, src_ranks = src
+            if not isinstance(src_group_name, str):
+                raise TypeError(
+                    f"src_group_name must be a string. But got {type(src_group_name)}."
+                )
+            if not isinstance(src_ranks, int) and not isinstance(src_ranks, tuple):
+                raise TypeError(
+                    f"src_ranks must be an int or tuple. But got {type(src_ranks)}."
+                )
+            src_addr = WorkerAddress(src_group_name, ranks=src_ranks)
+        else:
+            src_addr = worker_addresses[0]
+        with self._lock:
+            worker_addresses.sort()
+            group = self._collective.create_collective_group(worker_addresses)
+
+        return group.broadcast(
+            object=object,
+            src_addr=src_addr,
+            async_op=async_op,
+            options=options,
+        )
 
     def create_channel(
         self,
         channel_name: str,
-        node_rank: int = 0,
         maxsize: int = 0,
+        distributed: bool = False,
+        node_rank: int = 0,
         local: bool = False,
     ):
         """Create a new channel with the specified placement rank and maximum size.
 
         Args:
             channel_name (str): The name of the channel.
-            node_rank (int): The global rank of the node in the cluster where the channel will be created.
             maxsize (int): The maximum size of the channel queue. Defaults to 0 (unbounded).
-            local (bool): Create the channel for intra-process communication. Cannot be connected by other workers.
+            distributed (bool): Whether the channel should be distributed. A distributed channel creates a distributed worker on each node, and routes communications to the channel worker on the same node as the current worker, benefitting from the locality of the data. The routing is based on the key of the put/get APIs. So if you expect the key to be randomly distributed, you should set this to False to avoid unnecessary routing overhead.
+            node_rank (int): The node rank of the current worker. Only valid when distributed is False.
+            local (bool): Create the channel for intra-process communication. A local channel cannot be connected by other workers, and its data cannot be shared among different processes.
 
         Returns:
             Channel: A new instance of the Channel class.
@@ -682,7 +818,11 @@ class Worker(metaclass=WorkerMeta):
         from ..channel.channel import Channel
 
         return Channel.create(
-            name=channel_name, node_rank=node_rank, maxsize=maxsize, local=local
+            name=channel_name,
+            maxsize=maxsize,
+            distributed=distributed,
+            node_rank=node_rank,
+            local=local,
         )
 
     def connect_channel(self, channel_name: str):
@@ -697,25 +837,397 @@ class Worker(metaclass=WorkerMeta):
         """
         from ..channel.channel import Channel
 
-        return Channel.connect(channel_name=channel_name, current_worker=self)
+        return Channel.connect(name=channel_name, current_worker=self)
 
-    def broadcast(self, object: Optional[Any], ranks: list[int]):
-        """Broadcast an object inside the current worker group.
+    def send_to(
+        self,
+        group_name: str,
+        channel: Any | None,
+        data: Any,
+        *,
+        route_key: Any = None,
+        mode: str | None = None,
+        tag: str | None = None,
+        async_op: bool = False,
+        batch_size: int | None = None,
+        split_fn: Optional[Callable[[Any, list[int]], list[Any]]] = None,
+        enable_p2p: bool = False,
+        options: Optional["CollectiveGroupOptions"] = None,
+        decoupled_mode: bool = False,
+        send_queue_size: int = 0,
+    ):
+        """Send a payload to another worker group according to a routing plan.
+
+        The payload is split into shards based on the generated send plan. Each shard
+        is then sent either through ``channel.put`` or, when ``enable_p2p`` is True,
+        through the collective ``send`` API.
+
+        In normal mode, the routing plan is built from the current worker rank and the
+        destination group size. In decoupled mode, each shard is wrapped with route
+        metadata:
+
+            {
+                "batch_index": <route metadata>,
+                "batch": <payload shard>,
+            }
+
+        When ``tag`` exists in ``self.batch_router``, the stored batch indices are used
+        to route the response back to the workers that originally sent the batches.
+        Those stored routes are cleared after the send plan is built. Otherwise, the
+        current worker rank is encoded in the generated ``batch_index`` so a later
+        receiver can return results to this worker.
 
         Args:
-            object (Any): The object to broadcast. For non-src ranks, this is None.
-            ranks (List[int]): The ranks of the workers to broadcast the object to. The first in the list is the source.
-        """
-        if not ranks:
-            return object
+            group_name: Destination worker group name.
+            channel: Channel used for routed transfer. Required unless ``enable_p2p``
+                is True.
+            data: Payload to split and send.
+            route_key: Optional key used to separate independent routed streams.
+            mode: Optional phase name used only in decoupled routing. It is encoded in
+            ``batch_index`` so the response path can distinguish streams that share the
+            same base ``tag``. For example, ``mode="train"`` and
+            ``tag="rollout_results"`` make the return message use
+            ``"train_rollout_results"``.
+            tag: Optional routing tag used to build channel keys and decoupled
+                batch indices.
+            async_op: If True, return an ``AsyncRouteWork`` wrapping async send/put
+                operations.
+            batch_size: Total logical batch size to route. If omitted, it is inferred
+                from ``data`` and multiplied by the current worker group size.
+            split_fn: Optional custom function for splitting ``data`` by planned shard
+                sizes. If omitted, ``split_batch`` is used.
+            enable_p2p: If True, send shards with collective ``send`` instead of
+                ``channel.put``. Not supported with ``decoupled_mode``.
+            options: Optional collective options forwarded to ``send``.
+            decoupled_mode: If True, use decoupled routing and wrap each shard
+                with ``batch_index`` metadata.
+            send_queue_size: Number of send queue entries used when building the
+                decoupled send plan.
 
-        src_rank = ranks[0]
-        if self._rank == src_rank:
-            for rank in ranks[1:]:
-                self.send(object, self._group_name, rank)
+        Returns:
+            ``AsyncRouteWork`` if ``async_op`` is True; otherwise ``None``.
+        """
+        from ..collective import AsyncRouteWork
+        from .routing import (
+            build_send_plan,
+            decoupled_build_send_plan,
+            get_group_world_size,
+            infer_batch_size,
+            split_batch,
+        )
+
+        if decoupled_mode:
+            assert not enable_p2p, (
+                "Now, enable_p2p dpn't support when decoupled_mode is True."
+            )
+            assert getattr(self, "batch_router", None) is not None, (
+                "batch_router must be provided when decoupled_mode is True."
+            )
+
+        if not enable_p2p and channel is None:
+            raise ValueError("send_to requires ``channel`` when enable_p2p is False.")
+
+        world_size = get_group_world_size(self._manager_proxy, group_name)
+        if batch_size is None:
+            batch_size = infer_batch_size(data) * self._world_size
+
+        if not decoupled_mode:
+            plan = build_send_plan(
+                src_group_name=self.worker_address.root_group_name,
+                dst_group_name=group_name,
+                src_rank=self._rank,
+                src_world_size=self._world_size,
+                dst_world_size=world_size,
+                tag=tag if mode is None else f"{mode}_{tag}",
+                route_key=route_key,
+                batch_size=batch_size,
+            )
         else:
-            object = self.recv(self._group_name, src_rank)
-        return object
+            if tag in self.batch_router:
+                # if the batch_router has this tag
+                # The sending and receiving logic of batch_router is as follows:
+                # recv_from the worker -> Save the data's batch_index to batch_router[tag] ->
+                # Use the batch_router[tag] to get the batch_index to create the send plan ->
+                # Send data to the worker that originally sent it.
+                # the src_rank get from the batch_router[tag]
+                tag_batch_router = self.batch_router[tag]
+                src_rank = None
+            else:
+                # if the batch_router does not have this tag
+                # The sending and receiving logic is as follows:
+                # Save the send_rank in batch_index -> send the data and batch_index to channel ->
+                # Any workers can recv the data and save the batch_index -> handle the data in the worker ->
+                # Send the data to the worker that originally sent it by the batch_index.
+                # the src_rank is the current worker's rank
+                tag_batch_router = None
+                src_rank = self._rank
+
+            plan = decoupled_build_send_plan(
+                src_group_name=self.worker_address.root_group_name,
+                dst_group_name=group_name,
+                src_rank=src_rank,
+                src_world_size=self._world_size,
+                dst_world_size=world_size,
+                tag=tag,
+                route_key=route_key,
+                batch_size=batch_size,
+                tag_batch_router=tag_batch_router,
+                send_queue_size=send_queue_size,
+                mode=mode,
+            )
+            if tag_batch_router is not None:
+                # delete the used batch_router item to avoid duplicate sending
+                self.batch_router[tag] = []
+
+        split_sizes = [entry.batch_size for entry in plan.entries]
+        payloads = (
+            split_fn(data, split_sizes)
+            if split_fn is not None
+            else split_batch(data, split_sizes)
+        )
+
+        works = []
+        for entry, payload in zip(plan.entries, payloads):
+            if decoupled_mode:
+                # After enabling decoupled_mode, the data sending format is as follows:
+                # {
+                #     "batch_index": batch_index,
+                #     "batch": batch,
+                # }
+                # The batch_index is the index of the batch in the data.
+                # The batch is the data to send.
+                # batch_index: {send_rank}_{batch_idx}_{mode}_{tag}
+                # The send_rank is the rank of the worker that originally sent the data.
+                # The batch_idx is the index of the batch in the data.
+                # The tag is the tag of the data.
+                senditem = {
+                    "batch_index": entry.batch_index,
+                    "batch": payload,
+                }
+                work = channel.put(
+                    item=senditem,
+                    key=entry.key,
+                    async_op=async_op,
+                )
+            elif enable_p2p:
+                work = self.send(
+                    payload,
+                    dst_group_name=group_name,
+                    dst_rank=entry.peer_rank,
+                    async_op=async_op,
+                    options=options,
+                )
+            else:
+                work = channel.put(
+                    item=payload,
+                    key=entry.key,
+                    async_op=async_op,
+                )
+            if async_op and work is not None:
+                works.append(work)
+
+        if async_op:
+            return AsyncRouteWork(works, lambda _: None)
+        return None
+
+    def recv_from(
+        self,
+        group_name: str,
+        channel: Any | None,
+        *,
+        route_key: Any = None,
+        tag: str | None = None,
+        async_op: bool = False,
+        batch_size: int | None = None,
+        merge_fn: Optional[Callable[[list[Any]], Any]] = None,
+        infer_batch_size_fn: Optional[Callable[[Any], int]] = None,
+        enable_p2p: bool = False,
+        options: Optional["CollectiveGroupOptions"] = None,
+        decoupled_mode: bool = False,
+        recv_queue_size: int = 0,
+    ):
+        """Receive routed payload shards from another worker group.
+
+        This method builds a receive plan, receives one or more shards, validates their
+        batch sizes, and returns either a single payload or a merged payload. Shards can
+        be received through ``channel.get`` or, when ``enable_p2p`` is True, through the
+        collective ``recv`` API.
+
+        In decoupled mode, each channel item is expected to have the form:
+
+            {
+                "batch_index": <route metadata>,
+                "batch": <payload shard>,
+            }
+
+        When ``tag`` exists in ``self.batch_router``, the received ``batch_index`` values
+        are recorded in ``self.batch_router[tag]`` so a later ``send_to`` call can route
+        responses back to the original source workers. Otherwise, received shards are
+        sorted by the batch index encoded in ``batch_index`` before being merged.
+
+        Args:
+            group_name: Source worker group name.
+            channel: Channel used for routed transfer. Required unless ``enable_p2p``
+                is True.
+            route_key: Optional key used to separate independent routed streams.
+            tag: Optional routing tag used to build channel keys and decoupled
+                batch indices.
+            async_op: If True, return an ``AsyncRouteWork`` that finalizes the received
+                shards after all async receive operations complete.
+            batch_size: Expected local batch size after routing.
+            merge_fn: Optional custom function for merging received shards. If omitted,
+                ``merge_batches`` is used when more than one shard is received.
+            infer_batch_size_fn: Optional function used to infer shard batch size during
+                validation.
+            enable_p2p: If True, receive shards with collective ``recv`` instead of
+                ``channel.get``. Not supported with ``decoupled_mode``.
+            options: Optional collective options forwarded to ``recv``.
+            decoupled_mode: If True, use decoupled routing and unwrap
+                ``batch_index`` metadata from channel items.
+            recv_queue_size: Number of receive queue entries used when building the
+                decoupled receive plan.
+
+        Returns:
+            If ``async_op`` is True, an ``AsyncRouteWork``. Otherwise, returns ``None``
+            when no items are received, a single payload when one shard is received, or
+            the merged payload when multiple shards are received.
+        """
+        if decoupled_mode:
+            assert not enable_p2p, (
+                "Now, enable_p2p dpn't support when decoupled_mode is True."
+            )
+            assert getattr(self, "batch_router", None) is not None, (
+                "batch_router must be provided when decoupled_mode is True."
+            )
+
+        from ..collective import AsyncRouteWork
+        from .routing import (
+            build_recv_plan,
+            decoupled_build_recv_plan,
+            get_group_world_size,
+            merge_batches,
+            validate_batch_size,
+        )
+
+        if not enable_p2p and channel is None:
+            raise ValueError("recv_from requires ``channel`` when enable_p2p is False.")
+
+        world_size = get_group_world_size(self._manager_proxy, group_name)
+
+        if not decoupled_mode:
+            plan = build_recv_plan(
+                src_group_name=group_name,
+                dst_group_name=self.worker_address.root_group_name,
+                dst_rank=self._rank,
+                src_world_size=world_size,
+                dst_world_size=self._world_size,
+                tag=tag,
+                route_key=route_key,
+                batch_size=batch_size,
+            )
+        else:
+            if tag in self.batch_router:
+                # if the batch_router has this tag
+                # The sending and receiving logic of batch_router is as follows:
+                # recv_from the worker -> Save the data's batch_index to batch_router[tag] ->
+                # Use the batch_router[tag] to get the batch_index to create the send plan ->
+                # Send data to the worker that originally sent it.
+                # The recv_rank don't need to be provided
+                # The current worker will directly and arbitrarily fetch any data from the channel.
+                recv_rank = None
+            else:
+                # if the batch_router does not have this tag
+                # The sending and receiving logic is as follows:
+                # Save the send_rank in batch_index -> send the data and batch_index to channel ->
+                # Any workers can recv the data and save the batch_index -> handle the data in the worker ->
+                # Send the data to the worker that originally sent it by the batch_index.
+                # In this recv_from, the processed data will be received, so recv_rank needs to be set to the current worker rank
+                recv_rank = self._rank
+            plan = decoupled_build_recv_plan(
+                src_group_name=group_name,
+                dst_group_name=self.worker_address.root_group_name,
+                recv_rank=recv_rank,
+                src_world_size=self._world_size,
+                dst_world_size=world_size,
+                tag=tag,
+                route_key=route_key,
+                batch_size=batch_size,
+                recv_queue_size=recv_queue_size,
+            )
+
+        def _finalize(received_items: list[Any]):
+            if not received_items:
+                return None
+            if decoupled_mode:
+                # get the tag from the received_items
+                _, _, _, tag = split_channel_message(received_items[0]["batch_index"])
+                if tag in self.batch_router:
+                    # If the batch_router is provided,
+                    # Save the batch_index to the batch_router.
+                    list_received_items = []
+                    for item in received_items:
+                        batch_index = item["batch_index"]
+                        received_item = item["batch"]
+                        list_received_items.append(received_item)
+                        # Save the batch_index to the batch_router.
+                        self.batch_router[tag].append(batch_index)
+                    received_items = list_received_items
+                else:
+                    # Otherwise, the worker get the batch_index from the channel.
+                    # Sort the works by the batch_index.
+                    sorted_received_items = []
+                    for item in received_items:
+                        batch_index = item["batch_index"]
+                        received_item = item["batch"]
+                        # divide the batch_index into send_rank, batch_idx and tag
+                        # batch_index: {send_rank}_{batch_idx}_{mode}_{tag}
+                        _, batch_idx, _, _ = split_channel_message(batch_index)
+                        sorted_received_items.append((batch_idx, received_item))
+                    sorted_received_items.sort(key=lambda x: x[0])
+                    received_items = [x[1] for x in sorted_received_items]
+
+            for item, entry in zip(received_items, plan.entries):
+                validate_batch_size(
+                    data=item,
+                    expected_batch_size=entry.batch_size,
+                    infer_batch_size_fn=infer_batch_size_fn,
+                )
+            if merge_fn is not None:
+                return merge_fn(received_items)
+            if len(received_items) == 1:
+                return received_items[0]
+            return merge_batches(received_items)
+
+        if async_op:
+            if enable_p2p:
+                works = [
+                    self.recv(
+                        src_group_name=group_name,
+                        src_rank=entry.peer_rank,
+                        async_op=True,
+                        options=options,
+                    )
+                    for entry in plan.entries
+                ]
+            else:
+                works = [
+                    channel.get(key=entry.key, async_op=True) for entry in plan.entries
+                ]
+            return AsyncRouteWork(works, _finalize)
+
+        if enable_p2p:
+            received_items = [
+                self.recv(
+                    src_group_name=group_name,
+                    src_rank=entry.peer_rank,
+                    async_op=False,
+                    options=options,
+                )
+                for entry in plan.entries
+            ]
+        else:
+            received_items = [channel.get(key=entry.key) for entry in plan.entries]
+        return _finalize(received_items)
 
     def get_name(self) -> str:
         """Convert the WorkerAddress to a string representation.
@@ -781,24 +1293,83 @@ class Worker(metaclass=WorkerMeta):
             raise ValueError(f"Timer '{tag}' has not been recorded.")
         return self._timer_metrics.pop(tag)
 
+    def pop_execution_times(self) -> dict[str, float]:
+        """Retrieve and clear all execution times."""
+        metrics = dict(self._timer_metrics)
+        self._timer_metrics.clear()
+        return metrics
+
+    @property
+    def _trace_category(self) -> str:
+        """The trace event category of this worker, i.e., its root group name."""
+        if getattr(self, "_worker_address", None) is not None:
+            return self._worker_address.root_group_name
+        return "worker"
+
     @contextmanager
-    def worker_timer(self, tag: Optional[str] = None):
+    def worker_timer(self, tag: Optional[str] = None, trace: bool = True):
         """Context manager to time the execution of a worker function.
 
         Args:
             tag (str): The name of the timer to record the execution time for. Default is the current function name.
+            trace (bool): Whether to also emit a trace event; no-op if the tracer is not initialized.
         """
         if tag is None:
             frame_num = 2
             frame = inspect.stack()[frame_num]
             tag = frame.function
         assert tag is not None, "Timer tag must be provided."
+        if trace:
+            # Lazy import to avoid a circular import (Tracer lives under ..manager).
+            from ..manager import Tracer
+        else:
+            Tracer = None
+        if Tracer is not None:
+            Tracer.trace_begin(tag, cat=self._trace_category)
         try:
             start_time = time.perf_counter()
             yield
         finally:
             duration = time.perf_counter() - start_time
             self._timer_metrics[tag] = self._timer_metrics.get(tag, 0.0) + duration
+            if Tracer is not None:
+                Tracer.trace_end(tag, cat=self._trace_category)
+
+    @staticmethod
+    def timer(tag: Optional[str] = None, trace: bool = True):
+        """Decorator to time a worker function, emitting a profiling annotation and optionally a trace event."""
+
+        def decorator(func):
+            label = tag or func.__name__
+            if inspect.iscoroutinefunction(func):
+
+                @functools.wraps(func)
+                async def wrapper(self, *args, **kwargs):
+                    with self.worker_timer(label, trace=trace):
+                        with AcceleratorUtil.profiling_range(
+                            self._accelerator_type, label
+                        ):
+                            return await func(self, *args, **kwargs)
+
+                return wrapper
+
+            @functools.wraps(func)
+            def wrapper(self, *args, **kwargs):
+                with self.worker_timer(label, trace=trace):
+                    with AcceleratorUtil.profiling_range(self._accelerator_type, label):
+                        return func(self, *args, **kwargs)
+
+            return wrapper
+
+        return decorator
+
+    def start_profile(self, step_idx: int) -> None:
+        """Open a profiling capture window for the given step on this worker."""
+        AcceleratorUtil.start_profiling(self._accelerator_type, step_idx)
+
+    def stop_profile(self) -> None:
+        """Close the current profiling capture window on this worker."""
+        AcceleratorUtil.stop_profiling(self._accelerator_type)
 
     @staticmethod
     def check_worker_alive(worker_name: str) -> bool:
@@ -811,10 +1382,15 @@ class Worker(metaclass=WorkerMeta):
             bool: True if the worker is alive, False otherwise.
         """
         try:
-            ray.get_actor(worker_name)
-        except ValueError:
-            return False
-        return True
+            with without_http_proxies():
+                actors = ray.util.state.list_actors(
+                    filters=[("NAME", "=", worker_name), ("STATE", "!=", "DEAD")]
+                )
+
+            return len(actors) > 0
+        except Exception:
+            # Simply treat the worker as alive if any unexpected error occurs during state query
+            return True
 
     def _check_initialized(self):
         """Check if the Worker has been initialized.
@@ -1005,16 +1581,26 @@ class Worker(metaclass=WorkerMeta):
                 "Failed to register signal handlers. This may happen if the Worker is not running in the main thread."
             )
 
-    def _set_new_omegaconf_resolvers(self):
-        OmegaConf.register_new_resolver("multiply", lambda x, y: x * y, replace=True)
-        OmegaConf.register_new_resolver("int_div", lambda x, y: x // y, replace=True)
-        OmegaConf.register_new_resolver("subtract", lambda x, y: x - y, replace=True)
-        OmegaConf.register_new_resolver(
-            "torch.dtype", lambda dtype_name: getattr(torch, dtype_name), replace=True
-        )
+    def _enable_ptrace(self):
+        """Enable ptrace from any same-UID process. Used for enable CUDAIPC when PTRACE is disabled.
 
-    def _get_p2p_collective_group(self, peer_addr: WorkerAddress):
-        """Get a P2P collective group for communication with a peer worker."""
+        https://gist.github.com/youkaichao/8f87555bdeaaf68f4492b0dc96fbd206
+        """
+        # https://github.com/torvalds/linux/blob/24d479d26b25bce5faea3ddd9fa8f3a6c3129ea7/include/uapi/linux/prctl.h#L155
+        PR_SET_PTRACER = 0x59616D61
+        PR_SET_PTRACER_ANY = -1
+
+        try:
+            libc = ctypes.CDLL("libc.so.6")
+
+            result = libc.prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0)
+            if result != 0:
+                warnings.warn("prctl(PR_SET_PTRACER, ANY) failed!")
+        except Exception as e:
+            warnings.warn(f"Failed to enable ptrace from any same-UID process: {e}")
+
+    def _get_collective_group(self, peer_addr: WorkerAddress):
+        """Get a collective group for communication with a peer worker."""
         workers = [self._worker_address, peer_addr]
         # Ensure the order is the same with the same two ranks
         workers = sorted(workers, key=lambda x: x.get_name())
@@ -1038,11 +1624,17 @@ class Worker(metaclass=WorkerMeta):
         self._worker_info = WorkerInfo(
             address=self._worker_address,
             rank=self._rank,
+            group_world_size=self._world_size,
             cluster_node_rank=self._cluster_node_rank,
             accelerator_type=self._accelerator_type,
+            accelerator_model=self._accelerator_model,
             accelerator_rank=self._local_accelerator_rank,
             node_ip=node_ip,
             node_port=node_port,
             available_accelerators=self.global_accelerator_ids,
             hardware_infos=self.hardware_infos,
         )
+
+    def __repr__(self):
+        """Return a string representation of the Worker."""
+        return f"{self._group_name}(rank={self._rank})"

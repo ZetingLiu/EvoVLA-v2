@@ -1,4 +1,4 @@
-# Copyright 2025 The RLinf Authors.
+# Copyright 2026 The RLinf Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,20 +15,29 @@
 import math
 import random
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-import jax
 import numpy as np
 import torch
+import torch.nn.functional as F
 from openpi import transforms as _transforms
 from openpi.models import model as _model
 from openpi.models.pi0_config import Pi0Config
 from openpi.models_pytorch.pi0_pytorch import PI0Pytorch, make_att_2d_masks
+from torch.utils._pytree import tree_map
 
-from rlinf.models.embodiment.base_policy import BasePolicy
+from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
 from rlinf.models.embodiment.modules.explore_noise_net import ExploreNoiseNet
 from rlinf.models.embodiment.modules.value_head import ValueHead
+from rlinf.utils.logging import get_logger
+from rlinf.utils.nested_dict_process import copy_dict_tensor
+from rlinf.utils.pytree import register_pytree_dataclasses
+
+
+def _to_numpy(x):
+    return np.asarray(x.detach().cpu()) if torch.is_tensor(x) else x
 
 
 @dataclass(frozen=True)
@@ -36,7 +45,7 @@ class OpenPi0Config(Pi0Config):
     # config for rl
     config_name: str = "pi0_libero"  # pi0_libero, pi05_libero, pi0_maniskill, pi05_maniskill, pi0_metaworld, pi05_metaworld
     num_images_in_input: int = 2  # number of images in input
-    noise_method: str = "flow_sde"  # flow_sde, flow_noise, flow_cps
+    noise_method: str = "flow_sde"  # flow_ode, flow_sde, flow_noise, flow_cps
     # noise config for flow-sde
     noise_level: float = 0.5
     noise_anneal: bool = False
@@ -64,8 +73,37 @@ class OpenPi0Config(Pi0Config):
     value_after_vlm: bool = False  # value after vlm, pi05 mode
     value_vlm_mode: str = "mean_token"  # last_token, mean_token, first_token
 
+    # ===== DSRL-specific parameters =====
+    use_dsrl: bool = False  # Enable DSRL algorithm
+    dsrl_state_dim: int = 8  # Raw state dimension for DSRL encoders
+    dsrl_action_noise_dim: int = 32  # Noise dimension output by GaussianPolicy
+    dsrl_num_q_heads: int = 10  # Number of Q-networks
+    dsrl_agg_q: str = "mean"  # Q aggregation method: 'mean' | 'min'
+    dsrl_image_latent_dim: int = 64  # Latent dim for lightweight image encoder
+    dsrl_state_latent_dim: int = 64  # Hidden dim for state encoder
+    dsrl_hidden_dims: tuple = field(
+        default_factory=lambda: (128, 128, 128)
+    )  # Hidden dims for Q-head and GaussianPolicy
 
-class OpenPi0ForRLActionPrediction(BasePolicy, PI0Pytorch):
+    # ===== NFT-specific parameters =====
+    is_nft: bool = False
+
+    # ===== RLT SFT parameters =====
+    use_rlt: bool = False
+    rlt_alpha: float = 1.0
+    rlt_input_dim: int = 2048
+    rlt_embed_dim: int = 2048
+    rlt_num_rl_tokens: int = 1
+    rlt_prefix_seq_len: int = 768
+    rlt_num_layers: int = 2
+    rlt_num_heads: int = 8
+    rlt_mlp_ratio: float = 4.0
+    rlt_image_only: bool = True
+    rlt_use_mask: bool = False
+    state_indices: list[int] | None = None
+
+
+class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
     """
     Pi0 model for reinforcement learning action prediction.
     """
@@ -74,14 +112,39 @@ class OpenPi0ForRLActionPrediction(BasePolicy, PI0Pytorch):
 
     @property
     def _no_split_modules(self) -> list[str]:
-        # Currently, PaliGemmaForConditionalGeneration only support DDP, as many of it's modules are called without forward
+        if self.config.train_expert_only:
+            no_split_modules = [
+                "GemmaDecoderLayer",
+                "SiglipVisionEmbeddings",
+                "GemmaRMSNorm",
+                "GemmaRotaryEmbedding",
+            ]
+        else:
+            no_split_modules = [
+                "GemmaMLP",
+                "SiglipVisionEmbeddings",
+                "GemmaRMSNorm",
+                "GemmaRotaryEmbedding",
+            ]
+        if self.config.noise_method == "flow_noise":
+            no_split_modules.append("ExploreNoiseNet")
+        if self.config.use_rlt:
+            no_split_modules.append("RLTSelfAttentionLayer")
+        return no_split_modules
+
+    @property
+    def _no_split_names(self) -> list[str]:
         return [
-            "PaliGemmaForConditionalGeneration",
-            "GemmaDecoderLayer",
-            "SiglipVisionEmbeddings",
-            "GemmaRMSNorm",
-            "GemmaForCausalLM",
-            "GemmaRotaryEmbedding",
+            "action_in_proj",
+            "action_out_proj",
+            "lm_head",
+            # --pi0 only--
+            "state_proj",
+            "action_time_mlp_in",
+            "action_time_mlp_out",
+            # --pi05 only--
+            "time_mlp_in",
+            "time_mlp_out",
         ]
 
     def __init__(
@@ -90,8 +153,9 @@ class OpenPi0ForRLActionPrediction(BasePolicy, PI0Pytorch):
     ):
         # Override `sample_actions` to prevent parent class polymorphic call
         sample_actions_func = self.sample_actions
-        PI0Pytorch.__init__(self, config)
+        super().__init__(config)
         self.sample_actions = sample_actions_func
+        self.logger = get_logger()
         self.global_step = 0
         # assert
         assert not (self.config.double_layer and self.config.joint_logprob), (
@@ -105,7 +169,11 @@ class OpenPi0ForRLActionPrediction(BasePolicy, PI0Pytorch):
             proj_width = 1024
         # value head
         if self.config.add_value_head:
-            if self.config.config_name == "pi05_maniskill":
+            if self.config.config_name in [
+                "pi05_maniskill",
+                "pi05_libero",
+                "pi05_droid_polaris",
+            ]:
                 value_head_hidden_sizes = (1024, 512, 256)
             else:
                 value_head_hidden_sizes = (512, 256, 128)
@@ -116,9 +184,6 @@ class OpenPi0ForRLActionPrediction(BasePolicy, PI0Pytorch):
                 output_dim=1,
                 activation=value_head_activation,
                 bias_last=True,
-            )
-            self.value_head = self.value_head.to(
-                dtype=self.action_out_proj.weight.dtype
             )
         self.use_vlm_value = getattr(self.config, "value_after_vlm", False) and getattr(
             self.config, "add_value_head", False
@@ -133,32 +198,89 @@ class OpenPi0ForRLActionPrediction(BasePolicy, PI0Pytorch):
                 noise_logvar_range=self.config.noise_logvar_range,
                 noise_scheduler_type="learn",
             )
-            self.noise_head = self.noise_head.to(
-                dtype=self.action_out_proj.weight.dtype
+
+        if self.config.use_rlt:
+            from rlinf.models.embodiment.modules.rlt_token_transformer import (
+                RLTTokenTransformer,
             )
+
+            self.rlt_module = RLTTokenTransformer(
+                input_dim=self.config.rlt_input_dim,
+                embed_dim=self.config.rlt_embed_dim,
+                num_rl_tokens=self.config.rlt_num_rl_tokens,
+                prefix_seq_len=self.config.rlt_prefix_seq_len,
+                num_layers=self.config.rlt_num_layers,
+                num_heads=self.config.rlt_num_heads,
+                mlp_ratio=self.config.rlt_mlp_ratio,
+            ).to(dtype=torch.bfloat16)
+
+        # ===== DSRL components initialization =====
+        if self.config.use_dsrl:
+            from rlinf.models.embodiment.modules.compact_encoders import (
+                CompactMultiQHead,
+                CompactStateEncoder,
+                LightweightImageEncoder64,
+            )
+            from rlinf.models.embodiment.modules.gaussian_policy import GaussianPolicy
+
+            # Use explicit bfloat16 to match the backbone dtype that will be
+            # loaded from the checkpoint later.  At __init__ time the backbone
+            # parameters are still float32 (weights are loaded afterwards by
+            # safetensors.torch.load_model), so next(self.parameters()).dtype
+            # would incorrectly return float32.  Hardcoding bfloat16 here
+            # ensures all parameters share a single dtype when FSDP creates
+            # its FlatParameter, avoiding the writeback shape-mismatch error.
+            _dsrl_dtype = torch.bfloat16
+
+            dsrl_input_dim = (
+                self.config.dsrl_state_latent_dim + self.config.dsrl_image_latent_dim
+            )  # e.g. 64 + 64 = 128
+
+            self.dsrl_action_noise_net = GaussianPolicy(
+                input_dim=dsrl_input_dim,
+                output_dim=self.config.dsrl_action_noise_dim,
+                hidden_dims=self.config.dsrl_hidden_dims,
+                low=None,
+                high=None,
+                action_horizon=self.config.action_horizon,
+            ).to(dtype=_dsrl_dtype)
+
+            self.actor_image_encoder = LightweightImageEncoder64(
+                num_images=1,
+                latent_dim=self.config.dsrl_image_latent_dim,
+                image_size=64,
+            ).to(dtype=_dsrl_dtype)
+            self.actor_state_encoder = CompactStateEncoder(
+                state_dim=self.config.dsrl_state_dim,
+                hidden_dim=self.config.dsrl_state_latent_dim,
+            ).to(dtype=_dsrl_dtype)
+            self.critic_image_encoder = LightweightImageEncoder64(
+                num_images=1,
+                latent_dim=self.config.dsrl_image_latent_dim,
+                image_size=64,
+            ).to(dtype=_dsrl_dtype)
+            self.critic_state_encoder = CompactStateEncoder(
+                state_dim=self.config.dsrl_state_dim,
+                hidden_dim=self.config.dsrl_state_latent_dim,
+            ).to(dtype=_dsrl_dtype)
+            self.q_head = CompactMultiQHead(
+                state_dim=self.config.dsrl_state_latent_dim,
+                image_dim=self.config.dsrl_image_latent_dim,
+                action_dim=self.config.dsrl_action_noise_dim,
+                hidden_dims=self.config.dsrl_hidden_dims,
+                num_q_heads=self.config.dsrl_num_q_heads,
+                output_dim=1,
+            ).to(dtype=_dsrl_dtype)
+
+        for name, module in self.named_modules():
+            # Set _fsdp_wrap_name to the last part of the path (e.g., "model.action_in_proj" -> "action_in_proj")
+            path_parts = name.split(".")
+            setattr(module, "_fsdp_wrap_name", path_parts[-1] if path_parts else name)
+
+        self.torch_compile_enabled = False
 
     def set_global_step(self, global_step):
         self.global_step = global_step
-
-    def _tensor_to_numpy(self, x):
-        """Convert tensor to numpy, handling BFloat16/Float16 conversion."""
-        if torch.is_tensor(x):
-            x_cpu = x.detach().cpu()
-            # BFloat16 and Float16 are not supported by numpy, convert to float32
-            if x_cpu.dtype in (torch.bfloat16, torch.float16):
-                x_cpu = x_cpu.float()
-            return np.asarray(x_cpu)
-        return x
-
-    def _tensor_to_numpy_single(self, x, index):
-        """Convert single tensor element to numpy, handling BFloat16/Float16 conversion."""
-        if torch.is_tensor(x):
-            x_cpu = x[index].detach().cpu()
-            # BFloat16 and Float16 are not supported by numpy, convert to float32
-            if x_cpu.dtype in (torch.bfloat16, torch.float16):
-                x_cpu = x_cpu.float()
-            return np.asarray(x_cpu)
-        return x[index]
 
     def setup_wrappers(
         self,
@@ -169,7 +291,7 @@ class OpenPi0ForRLActionPrediction(BasePolicy, PI0Pytorch):
         self._output_transform = _transforms.compose(output_transforms)
 
     def input_transform(self, obs: dict, transpose=True):
-        inputs = jax.tree.map(lambda x: x, obs)
+        inputs = tree_map(lambda x: x, obs)
         # process input
         first_process = "prompt" in inputs.keys()
         if first_process:
@@ -177,35 +299,37 @@ class OpenPi0ForRLActionPrediction(BasePolicy, PI0Pytorch):
         else:
             inputs = {key: inputs[key] for key in inputs.keys() if "/" in key}
 
-        # tensor -> numpy (Convert BFloat16/Float16 to float32 for numpy compatibility)
-        inputs = jax.tree.map(self._tensor_to_numpy, inputs)
+        # tensor -> numpy
+        inputs = tree_map(_to_numpy, inputs)
         batch_size = next(v.shape[0] for v in inputs.values() if hasattr(v, "shape"))
-        # split & transform
-        transformed_samples = []
+        # split
+        batch_samples = []
         for i in range(batch_size):
-            sample = jax.tree.map(lambda x: x[i], inputs)
+            sample = tree_map(lambda x: x[i], inputs)
             if transpose:
                 # convert from [3,256,256] -> [256,256,3]
-                sample = jax.tree.map(
-                    lambda x: x.transpose(1, 2, 0)
-                    if len(x.shape) == 3 and transpose
-                    else x,
+                sample = tree_map(
+                    lambda x: (
+                        x.transpose(1, 2, 0) if len(x.shape) == 3 and transpose else x
+                    ),
                     sample,
                 )
             else:
-                sample = jax.tree.map(lambda x: x if len(x.shape) == 3 else x, sample)
+                sample = tree_map(lambda x: x if len(x.shape) == 3 else x, sample)
             if first_process:
                 sample["prompt"] = obs["prompt"][i]
             else:
                 sample["prompt"] = "xxxx"
-            transformed_sample = self._input_transform(sample)
-            transformed_samples.append(transformed_sample)
+            batch_samples.append(sample)
+        # transform
+        with ThreadPoolExecutor(max_workers=min(len(batch_samples), 8)) as ex:
+            transformed_samples = list(ex.map(self._input_transform, batch_samples))
         # recombine
-        inputs = jax.tree.map(
+        inputs = tree_map(
             lambda *torch_arr: torch.from_numpy(np.asarray(torch_arr).copy()),
             *transformed_samples,
         )
-        # inputs = jax.tree.map(lambda *x: torch.stack(x, axis=0), inputs)
+        # inputs = tree_map(lambda *x: torch.stack(x, axis=0), inputs)
         if not first_process:
             inputs["tokenized_prompt"] = obs["tokenized_prompt"]
             inputs["tokenized_prompt_mask"] = obs["tokenized_prompt_mask"]
@@ -216,41 +340,382 @@ class OpenPi0ForRLActionPrediction(BasePolicy, PI0Pytorch):
         batch_size = outputs["actions"].shape[0]
         transformed_samples = []
         for i in range(batch_size):
-            sample = jax.tree.map(lambda x: self._tensor_to_numpy_single(x, i), outputs)
+            sample = tree_map(lambda x: np.asarray(x[i].detach().cpu()), outputs)
             sample = self._output_transform(sample)
             transformed_samples.append(sample)
         # recombine
-        outputs = jax.tree.map(
+        outputs = tree_map(
             lambda *torch_arr: torch.from_numpy(np.asarray(torch_arr).copy()),
             *transformed_samples,
         )
         outputs["actions"] = outputs["actions"][:, : self.config.action_chunk]
         return outputs
 
-    def forward(self, forward_type="default_forward", **kwargs):
-        if forward_type == "sft_forward":
+    def forward(self, forward_type=ForwardType.DEFAULT, **kwargs):
+        if forward_type == ForwardType.SFT:
             return self.sft_forward(**kwargs)
-        elif forward_type == "default_forward":
+        elif forward_type == ForwardType.DEFAULT:
             return self.default_forward(**kwargs)
+        elif forward_type == ForwardType.NFT:
+            return self.nft_forward(**kwargs)
+        elif forward_type == ForwardType.SAC:
+            return self.sac_forward(**kwargs)
+        elif forward_type == ForwardType.SAC_Q:
+            return self.sac_q_forward(**kwargs)
         else:
             raise NotImplementedError
 
-    def sft_forward(self, data, **kwargs):
-        observation = data["observation"]
-        actions = data["actions"]
-        return PI0Pytorch.forward(self, observation, actions)
+    def sft_forward(self, data, use_action_chunk_loss: bool = False, **kwargs):
+        if hasattr(self, "gradient_checkpointing_disable"):
+            self.gradient_checkpointing_disable()
+
+        if isinstance(data, tuple):
+            observation, actions = data
+        else:
+            observation = data["observation"]
+            actions = data["actions"]
+
+        device = next(self.parameters()).device
+        register_pytree_dataclasses(observation)
+        observation = tree_map(
+            lambda x: (
+                torch.as_tensor(x, device=device).contiguous().clone()
+                if x is not None
+                else x
+            ),
+            observation,
+        )
+        if not isinstance(actions, torch.Tensor):
+            actions = torch.as_tensor(actions, device=device)
+        else:
+            actions = actions.to(device=device)
+        actions = actions.to(dtype=torch.float32)
+
+        # PI0Pytorch.forward returns per-element MSE (reduction="none").
+        if self.config.use_rlt:
+            loss, prefix_output, prefix_mask = self._sft_forward_with_rlt_prefix(
+                observation, actions
+            )
+        else:
+            loss = super().forward(observation, actions)
+        if use_action_chunk_loss:
+            loss = loss[:, : self.config.action_chunk, : self.config.action_env_dim]
+        vla_loss = loss.mean()
+        if not self.config.use_rlt:
+            return vla_loss
+
+        rlt_param = next(self.rlt_module.parameters())
+        prefix_output = prefix_output.to(device=rlt_param.device, dtype=rlt_param.dtype)
+        rlt_mask = prefix_mask if self.config.rlt_use_mask else None
+        rlt_loss, _ = self.rlt_module(prefix_output, rlt_mask)
+        total_loss = rlt_loss + self.config.rlt_alpha * vla_loss
+        return {
+            "loss": total_loss,
+            "vla_loss": vla_loss,
+            "rlt_loss": rlt_loss,
+        }
+
+    def _sft_forward_with_rlt_prefix(self, observation, actions):
+        images, img_masks, lang_tokens, lang_masks, state = (
+            self._preprocess_observation(observation, train=True)
+        )
+
+        noise = self.sample_noise(actions.shape, actions.device)
+        time = self.sample_time(actions.shape[0], actions.device)
+
+        time_expanded = time[:, None, None]
+        x_t = time_expanded * noise + (1 - time_expanded) * actions
+        u_t = noise - actions
+
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks
+        )
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = (
+            self.embed_suffix(state, x_t, time)
+        )
+        backbone_dtype = self.paligemma_with_expert.paligemma.language_model.layers[
+            0
+        ].self_attn.q_proj.weight.dtype
+        if prefix_embs.dtype != backbone_dtype:
+            prefix_embs = prefix_embs.to(dtype=backbone_dtype)
+        if suffix_embs.dtype != backbone_dtype:
+            suffix_embs = suffix_embs.to(dtype=backbone_dtype)
+
+        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+        position_ids = torch.cumsum(pad_masks, dim=1) - 1
+        att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
+
+        def forward_func(
+            prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
+        ):
+            (prefix_output, suffix_out), _ = self.paligemma_with_expert.forward(
+                attention_mask=att_2d_masks_4d,
+                position_ids=position_ids,
+                past_key_values=None,
+                inputs_embeds=[prefix_embs, suffix_embs],
+                use_cache=False,
+                adarms_cond=[None, adarms_cond],
+            )
+            return prefix_output, suffix_out
+
+        prefix_output, suffix_out = self._apply_checkpoint(
+            forward_func,
+            prefix_embs,
+            suffix_embs,
+            att_2d_masks_4d,
+            position_ids,
+            adarms_cond,
+        )
+
+        suffix_out = suffix_out[:, -self.config.action_horizon :]
+        suffix_out = suffix_out.to(dtype=torch.float32)
+
+        def action_out_proj_func(suffix_out):
+            return self.action_out_proj(suffix_out)
+
+        v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
+        loss = F.mse_loss(u_t, v_t, reduction="none")
+
+        prefix_output, prefix_pad_masks = self._select_rlt_prefix_embeddings(
+            prefix_output.detach(), prefix_pad_masks, lang_tokens
+        )
+        return loss, prefix_output, prefix_pad_masks
+
+    def _build_rlt_prefix_cache(self, observation, *, train: bool):
+        images, img_masks, lang_tokens, lang_masks, state = (
+            self._preprocess_observation(observation, train=train)
+        )
+        device = next(self.parameters()).device
+        images = [img.to(device) for img in images]
+        img_masks = [img_mask.to(device) for img_mask in img_masks]
+        if lang_tokens is not None:
+            lang_tokens = lang_tokens.to(device)
+        if lang_masks is not None:
+            lang_masks = lang_masks.to(device)
+        state = state.to(device)
+
+        prefix_output, prefix_pad_masks, past_key_values = self._build_prefix_cache(
+            images, img_masks, lang_tokens, lang_masks
+        )
+        return prefix_output, prefix_pad_masks, past_key_values, lang_tokens, state
+
+    def _select_rlt_prefix_embeddings(
+        self, prefix_output, prefix_pad_masks, lang_tokens
+    ):
+        if self.config.rlt_image_only and lang_tokens is not None:
+            num_image_tokens = prefix_output.shape[1] - lang_tokens.shape[1]
+            prefix_output = prefix_output[:, :num_image_tokens]
+            prefix_pad_masks = prefix_pad_masks[:, :num_image_tokens]
+        return prefix_output, prefix_pad_masks
+
+    def _extract_rlt_prefix_embeddings(self, observation, *, train: bool):
+        with torch.no_grad():
+            prefix_output, prefix_pad_masks, _, lang_tokens, _ = (
+                self._build_rlt_prefix_cache(observation, train=train)
+            )
+
+        return self._select_rlt_prefix_embeddings(
+            prefix_output, prefix_pad_masks, lang_tokens
+        )
+
+    def _select_configured_state(self, states):
+        indices = self.config.state_indices
+        if not indices:
+            return states
+        indices = list(indices)
+
+        if hasattr(states, "shape"):
+            state_dim = states.shape[-1]
+        else:
+            state_dim = np.asarray(states).shape[-1]
+        if state_dim == len(indices):
+            return states
+        if state_dim <= max(indices):
+            raise ValueError(
+                f"Cannot select state_indices={indices} from state dim {state_dim}."
+            )
+
+        if torch.is_tensor(states):
+            index_tensor = torch.as_tensor(indices, device=states.device)
+            return states.index_select(-1, index_tensor)
+        return np.asarray(states)[..., indices]
+
+    @torch.no_grad()
+    def extract_rlt_obs(
+        self,
+        env_obs: dict[str, Any],
+    ) -> dict[str, torch.Tensor]:
+        if not self.config.use_rlt or not hasattr(self, "rlt_module"):
+            raise ValueError("extract_rlt_obs requires openpi.use_rlt=True.")
+
+        to_process_obs = self.obs_processor(env_obs)
+        processed_obs = self.input_transform(to_process_obs, transpose=False)
+        processed_obs = self.precision_processor(processed_obs)
+        observation = _model.Observation.from_dict(processed_obs)
+
+        prefix_output, prefix_pad_masks, past_key_values, lang_tokens, state = (
+            self._build_rlt_prefix_cache(observation, train=False)
+        )
+        rlt_prefix_output, rlt_prefix_mask = self._select_rlt_prefix_embeddings(
+            prefix_output, prefix_pad_masks, lang_tokens
+        )
+        rlt_param = next(self.rlt_module.parameters())
+        rlt_prefix_output = rlt_prefix_output.to(
+            device=rlt_param.device, dtype=rlt_param.dtype
+        )
+        rlt_mask = rlt_prefix_mask if self.config.rlt_use_mask else None
+        z_rl = self.rlt_module.encode_flat(rlt_prefix_output, rlt_mask).to(
+            dtype=torch.float32
+        )
+
+        outputs = self._sample_actions_with_prefix_cache(
+            state,
+            prefix_output,
+            prefix_pad_masks,
+            past_key_values,
+            mode="eval",
+            compute_values=False,
+        )
+        ref_chunk = self.output_transform(
+            {"actions": outputs["actions"], "state": observation.state}
+        )["actions"]
+        raw_proprio = self._select_configured_state(env_obs["states"])
+        if (
+            isinstance(self.config.config_name, str)
+            and "maniskill" in self.config.config_name.lower()
+        ):
+            state_dim = (
+                raw_proprio.shape[-1]
+                if hasattr(raw_proprio, "shape")
+                else np.asarray(raw_proprio).shape[-1]
+            )
+            proprio = observation.state[..., :state_dim]
+        else:
+            proprio = raw_proprio
+        if not torch.is_tensor(proprio):
+            proprio = torch.as_tensor(proprio)
+
+        return {
+            "z_rl": z_rl,
+            "proprio": proprio.to(device=z_rl.device, dtype=torch.float32),
+            "ref_chunk": ref_chunk.to(device=z_rl.device, dtype=torch.float32),
+        }
+
+    def prepare_dagger_sft_batch(self, batch):
+        """Prepare replay-buffer samples for DAgger SFT updates."""
+        device = next(self.parameters()).device
+        obs_dict = {}
+        obs_prefix_keys = [k for k in batch.keys() if k.startswith("observation/")]
+        for key in obs_prefix_keys:
+            obs_dict[key] = batch[key]
+        if "tokenized_prompt" in batch:
+            obs_dict["tokenized_prompt"] = batch["tokenized_prompt"]
+        if "tokenized_prompt_mask" in batch:
+            obs_dict["tokenized_prompt_mask"] = batch["tokenized_prompt_mask"]
+
+        bsz = batch["action"].shape[0]
+        if "model_action" in batch:
+            actions = (
+                batch["model_action"]
+                .reshape(bsz, self.config.action_horizon, self.config.action_dim)
+                .clone()
+            )
+            processed_obs = self.input_transform(obs_dict, transpose=False)
+            processed_obs = self.precision_processor(processed_obs)
+            observation = _model.Observation.from_dict(processed_obs)
+        else:
+            obs_dict["actions"] = batch["action"].reshape(
+                bsz, self.config.action_chunk, -1
+            )
+            obs_dict["prompt"] = ["empty" for _ in range(bsz)]
+            processed_obs = self.input_transform(obs_dict, transpose=False)
+            if "tokenized_prompt" in batch:
+                processed_obs["tokenized_prompt"] = batch["tokenized_prompt"]
+            if "tokenized_prompt_mask" in batch:
+                processed_obs["tokenized_prompt_mask"] = batch["tokenized_prompt_mask"]
+            processed_obs = self.precision_processor(processed_obs)
+            observation = _model.Observation.from_dict(processed_obs)
+            actions = processed_obs["actions"].clone()
+            processed_obs.pop("actions")
+
+        register_pytree_dataclasses(observation)
+        observation = tree_map(
+            lambda x: torch.as_tensor(x, device=device).contiguous().clone(),
+            observation,
+        )
+        return {
+            "observation": observation,
+            "actions": actions.to(torch.float32).to(device),
+        }
+
+    def prepare_lerobot_sft_batch(self, batch):
+        """Prepare replay-buffer samples for DAgger SFT updates."""
+        device = next(self.parameters()).device
+        obs_dict = {}
+        raw_obs_keys = [
+            k
+            for k in batch.keys()
+            if k
+            in [
+                "image",
+                "wrist_image",
+                "extra_view_image",
+                "extra_view_image-0",
+                "extra_view_image-1",
+                "state",
+            ]
+        ]
+        _merge_keys = ["extra_view_image-0", "extra_view_image-1"]
+        merge_extra = "extra_view_image" not in raw_obs_keys and all(
+            k in raw_obs_keys for k in _merge_keys
+        )
+        for key in raw_obs_keys:
+            # process other keys
+            if merge_extra and key in _merge_keys:
+                continue
+            else:
+                obs_dict[f"observation/{key}"] = batch[key]
+        if merge_extra:
+            obs_dict["observation/extra_view_image"] = []
+            for key in _merge_keys:
+                obs_dict["observation/extra_view_image"].append(batch[key])
+            obs_dict["observation/extra_view_image"] = torch.stack(
+                obs_dict["observation/extra_view_image"], dim=1
+            )
+
+        bsz = batch["actions"].shape[0]
+        obs_dict["actions"] = batch["actions"].reshape(
+            bsz, self.config.action_chunk, -1
+        )
+        obs_dict["prompt"] = batch["task"]
+        processed_obs = self.input_transform(obs_dict, transpose=False)
+        processed_obs = self.precision_processor(processed_obs)
+        observation = _model.Observation.from_dict(processed_obs)
+        actions = processed_obs["actions"].clone()
+        processed_obs.pop("actions")
+        register_pytree_dataclasses(observation)
+        observation = tree_map(
+            lambda x: torch.as_tensor(x, device=device).contiguous().clone(),
+            observation,
+        )
+        return {
+            "observation": observation,
+            "actions": actions.to(torch.float32).to(device),
+        }
 
     def default_forward(
         self,
-        data: dict[str, torch.Tensor],
+        forward_inputs: dict[str, torch.Tensor],
         **kwargs,
     ) -> dict[str, Any]:
         # get kwargs
         compute_values = kwargs.get("compute_values", False)
-        chains = data["chains"]
-        denoise_inds = data["denoise_inds"]
+        chains = forward_inputs["chains"]
+        denoise_inds = forward_inputs["denoise_inds"]
         # input transform
-        observation = self.input_transform(data, transpose=False)
+        observation = self.input_transform(forward_inputs, transpose=False)
         observation = _model.Observation.from_dict(observation)
         images, img_masks, lang_tokens, lang_masks, state = (
             self._preprocess_observation(observation, train=False)
@@ -289,27 +754,59 @@ class OpenPi0ForRLActionPrediction(BasePolicy, PI0Pytorch):
             "entropy": entropy,
         }
 
+    def nft_forward(
+        self,
+        forward_inputs: dict[str, torch.Tensor],
+        **kwargs,
+    ) -> dict[str, Any]:
+        """Compute velocity v_theta at explicit (x_t, timesteps) for NFT loss."""
+        # obs process
+        observation = self.input_transform(forward_inputs, transpose=False)
+        observation = _model.Observation.from_dict(observation)
+        images, img_masks, lang_tokens, lang_masks, state = (
+            self._preprocess_observation(observation, train=False)
+        )
+        # move device
+        device = next(self.parameters()).device
+        images = [img.to(device) for img in images]
+        img_masks = [m.to(device) for m in img_masks]
+        state = state.to(device)
+        # nft inputs
+        nft_inputs = kwargs["nft_inputs"]
+        x_t = nft_inputs["x_t"].to(device)
+        t = nft_inputs["timesteps"].to(device)
+        # get v_theta
+        _, prefix_pad_masks, past_key_values = self._build_prefix_cache(
+            images, img_masks, lang_tokens, lang_masks
+        )
+        compute_values = kwargs.get("compute_values", False)
+        v_theta, suffix_out = self.get_velocity(
+            state, x_t, t, prefix_pad_masks, past_key_values
+        )
+        v_theta = v_theta[:, : self.config.action_chunk, :]
+        # result
+        result: dict[str, Any] = {"v_theta": v_theta, "x_t": x_t, "timesteps": t}
+        if compute_values and self.config.add_value_head:
+            result["values"] = self._compute_value_from_suffix(suffix_out)[:, None]
+        return result
+
     def obs_processor(self, env_obs):
-        # base observation
+        env_states = self._select_configured_state(env_obs["states"])
         processed_obs = {
             "observation/image": env_obs["main_images"],
             "prompt": env_obs["task_descriptions"],
         }
-        # state observation - ensure float32 to prevent BFloat16 conversion issues
         if "calvin" in self.config.config_name:
-            state = env_obs["states"]
+            state = env_states
             processed_obs["observation/state_ee_pos"] = state[:, :3]
             processed_obs["observation/state_ee_rot"] = state[:, 3:6]
             processed_obs["observation/state_gripper"] = state[:, 6:7]
         else:
-            state = env_obs["states"]
-            if torch.is_tensor(state):
-                state = state.to(dtype=torch.float32)
-            processed_obs["observation/state"] = state
-        # wrist image observation
+            processed_obs["observation/state"] = env_states
         if env_obs["wrist_images"] is not None:
             processed_obs["observation/wrist_image"] = env_obs["wrist_images"]
-        # store used keys
+        if env_obs["extra_view_images"] is not None:
+            processed_obs["observation/extra_view_image"] = env_obs["extra_view_images"]
         return processed_obs
 
     def precision_processor(self, processed_obs):
@@ -326,10 +823,9 @@ class OpenPi0ForRLActionPrediction(BasePolicy, PI0Pytorch):
                 processed_obs[key] = value.to(device=device).contiguous()
             elif isinstance(value, dict):
                 for sub_key, sub_value in value.items():
-                    if torch.is_tensor(sub_value):
-                        processed_obs[key][sub_key] = sub_value.to(
-                            device=device
-                        ).contiguous()
+                    processed_obs[key][sub_key] = sub_value.to(
+                        device=device
+                    ).contiguous()
         return processed_obs
 
     def predict_action_batch(
@@ -337,8 +833,8 @@ class OpenPi0ForRLActionPrediction(BasePolicy, PI0Pytorch):
         env_obs,
         mode: Literal["train", "eval"] = "train",
         compute_values=True,
-        return_obs=True,
-    ) -> tuple[np.ndarray, dict[str, Any]]:
+        **kwargs,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
         to_process_obs = self.obs_processor(env_obs)  # env obs -> policy input obs
         processed_obs = self.input_transform(
             to_process_obs, transpose=False
@@ -347,24 +843,80 @@ class OpenPi0ForRLActionPrediction(BasePolicy, PI0Pytorch):
             processed_obs
         )  # obs precision processor
         observation = _model.Observation.from_dict(processed_obs)
-        outputs = self.sample_actions(
-            observation, mode=mode, compute_values=compute_values
-        )
-        actions = self.output_transform(
-            {"actions": outputs["actions"], "state": observation.state}
-        )["actions"].numpy()
+
+        is_dsrl_active = self.config.use_dsrl
+        if is_dsrl_active:
+            # DSRL mode (both train and eval)
+
+            # Step 1: SAC agent outputs noise
+            dsrl_obs = {"images": [env_obs["main_images"]], "states": env_obs["states"]}
+
+            noise_actions, noise_logprob, _ = self.sac_forward(
+                dsrl_obs, train=False, mode=mode
+            )
+
+            # Step 2: Use noise to sample actual actions from diffusion model
+            outputs = self.sample_actions(
+                observation,
+                noise=noise_actions,
+                mode="eval",
+                compute_values=compute_values,
+            )
+
+            # Step 3: Extract actual actions for environment interaction
+            real_actions = self.output_transform(
+                {"actions": outputs["actions"], "state": observation.state}
+            )["actions"]
+
+            # Return actual actions to environment, but forward_inputs stores noise.
+            actions = real_actions
+            prev_logprobs = noise_logprob  # SAC noise logprob
+            prev_values = outputs.get("prev_values")
+            forward_action = noise_actions  # Used for SAC training
+
+        else:
+            # Non-DSRL or eval mode
+            outputs = self.sample_actions(
+                observation, mode=mode, compute_values=compute_values
+            )
+            actions = self.output_transform(
+                {"actions": outputs["actions"], "state": observation.state}
+            )["actions"]
+            prev_logprobs = outputs["prev_logprobs"]
+            prev_values = outputs["prev_values"]
+            forward_action = None
 
         forward_inputs = {
             "chains": outputs["chains"],
             "denoise_inds": outputs["denoise_inds"],
             "tokenized_prompt": processed_obs["tokenized_prompt"],
             "tokenized_prompt_mask": processed_obs["tokenized_prompt_mask"],
+            # "action" is the env-executed action, and "model_action" is the original output by the model.
+            # For small models, they are consistent. For large models (like pi), "action" is the result after output_transform.
+            # For realworld human-in-the-loop training, only "action" can be provided by human.
+            "action": actions.reshape(actions.shape[0], -1).contiguous(),
+            "model_action": outputs["actions"]
+            .reshape(outputs["actions"].shape[0], -1)
+            .contiguous(),
         }
-        forward_inputs.update(to_process_obs)
-        forward_inputs.pop("prompt", None)
+        if forward_action is not None:
+            forward_inputs["action"] = forward_action
+
+        if self.config.is_nft:
+            nft_outputs = {
+                key: value for key, value in outputs.items() if key.startswith("nft_")
+            }
+            forward_inputs.update(nft_outputs)
+
+        # Clone observations to avoid cross-step reference issues.
+        cloned_obs = copy_dict_tensor(
+            {k: v for k, v in to_process_obs.items() if k != "prompt"}
+        )
+        forward_inputs.update(cloned_obs)
+
         result = {
-            "prev_logprobs": outputs["prev_logprobs"],
-            "prev_values": outputs["prev_values"],
+            "prev_logprobs": prev_logprobs,
+            "prev_values": prev_values,
             "forward_inputs": forward_inputs,
         }
         return actions, result
@@ -380,32 +932,50 @@ class OpenPi0ForRLActionPrediction(BasePolicy, PI0Pytorch):
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
         bsize = observation.state.shape[0]
         device = observation.state.device
-        num_steps = self.config.num_steps
         if noise is None:
             actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
             noise = self.sample_noise(actions_shape, device)
+        else:
+            # DSRL: SAC provides noise, convert dtype to match action_in_proj
+            noise = noise.to(self.action_in_proj.weight.dtype)
 
         images, img_masks, lang_tokens, lang_masks, state = (
             self._preprocess_observation(observation, train=False)
         )
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+        prefix_output, prefix_pad_masks, past_key_values = self._build_prefix_cache(
             images, img_masks, lang_tokens, lang_masks
         )
-        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
-        # Compute image and language key value cache
-        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
-        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
-
-        (prefix_output, _), past_key_values = self.paligemma_with_expert.forward(
-            attention_mask=prefix_att_2d_masks_4d,
-            position_ids=prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
-            use_cache=True,
+        return self._sample_actions_with_prefix_cache(
+            state,
+            prefix_output,
+            prefix_pad_masks,
+            past_key_values,
+            noise=noise,
+            mode=mode,
+            compute_values=compute_values,
         )
+
+    def _sample_actions_with_prefix_cache(
+        self,
+        state,
+        prefix_output,
+        prefix_pad_masks,
+        past_key_values,
+        noise=None,
+        mode="train",
+        compute_values=True,
+    ) -> torch.Tensor:
+        bsize = state.shape[0]
+        device = state.device
+        num_steps = self.config.num_steps
+        if noise is None:
+            actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
+            noise = self.sample_noise(actions_shape, device)
+        else:
+            # DSRL: SAC provides noise, convert dtype to match action_in_proj
+            noise = noise.to(self.action_in_proj.weight.dtype)
 
         x_t = noise
         # add sde sample and traj collect
@@ -426,8 +996,9 @@ class OpenPi0ForRLActionPrediction(BasePolicy, PI0Pytorch):
         # In the joint logprob mode, we need to sample the logprob for each denoise step
         # In the non-joint logprob mode, only one denoise step is sampled and ode-sde mix sampling is used
         # denoise index
+        collect_nft_state = self.config.is_nft and mode == "train"
         if mode == "train":
-            if self.config.joint_logprob:
+            if self.config.joint_logprob or collect_nft_state:
                 denoise_inds = torch.arange(num_steps)
             else:
                 if self.config.ignore_last:
@@ -442,25 +1013,30 @@ class OpenPi0ForRLActionPrediction(BasePolicy, PI0Pytorch):
             denoise_inds = torch.tensor([-1] * num_steps)
         denoise_inds = denoise_inds[None].repeat(bsize, 1)
 
+        # collect nft states for nft algorithm
+        nft_state = self._init_nft_state(collect_nft_state, x_t, num_steps, device)
+
         # denoise step
         for idx in range(num_steps):
             # sample mean var val
             if idx == denoise_inds[0][idx]:
-                sample_mode = "train"
+                sample_method = self.config.noise_method
             else:
-                sample_mode = "eval"
-            x_t_mean, x_t_std, value_t = self.sample_mean_var_val(
+                sample_method = "flow_ode"
+            x_t_prev = x_t
+            x_t_mean, x_t_std, value_t, v_t = self.sample_mean_var_val(
                 x_t,
                 idx,
                 state,
                 prefix_pad_masks,
                 past_key_values,
-                sample_mode,
+                sample_method,
                 num_steps,
                 compute_values,
             )
             # Euler step - use new tensor assignment instead of in-place operation
             x_t = x_t_mean + self.sample_noise(x_t.shape, device) * x_t_std
+            self._update_nft_state(nft_state, idx, x_t_prev, v_t, x_t, sample_method)
             log_prob = self.get_logprob_norm(x_t, x_t_mean, x_t_std)
             # store
             values.append(value_t)
@@ -476,7 +1052,7 @@ class OpenPi0ForRLActionPrediction(BasePolicy, PI0Pytorch):
             log_probs = log_probs.mean(dim=1)
         else:
             log_probs = log_probs[
-                torch.arange(log_probs.shape[0]),
+                torch.arange(log_probs.shape[0], device=device),
                 denoise_inds[:, 0],
             ]
         # post process for value
@@ -484,13 +1060,22 @@ class OpenPi0ForRLActionPrediction(BasePolicy, PI0Pytorch):
             values = values_vlm[:, None]
         else:
             values = torch.stack(values, dim=1).mean(dim=-1, keepdim=True)
-        return {
+        result = {
             "actions": x_0,
             "chains": chains,
             "prev_logprobs": log_probs,
             "prev_values": values,
             "denoise_inds": denoise_inds,
         }
+        if collect_nft_state:
+            result.update(nft_state)
+            result["nft_x0"] = x_0.detach()
+        return result
+
+    def _get_timesteps(self, denoise_steps, device):
+        timesteps = torch.linspace(1, 1 / denoise_steps, denoise_steps, device=device)
+        timesteps = torch.cat([timesteps, torch.zeros((1), device=device)])
+        return timesteps
 
     def sample_mean_var_val(
         self,
@@ -499,107 +1084,73 @@ class OpenPi0ForRLActionPrediction(BasePolicy, PI0Pytorch):
         state,
         prefix_pad_masks,
         past_key_values,
-        mode,
+        sample_method,
         denoise_steps,
         compute_values=True,
     ):
         """
         Sample the mean, variance and value of the action at a given timestep.
-        Rollout sample (idx is int) and actor get_log_prob_value (idx is tensor) will load this function.
+        Rollout sample (idx is int) and actor get_log_prob_value (idx is tensor)
+        will load this function. `sample_method` is one of flow_ode/flow_sde/
+        flow_cps/flow_noise.
         """
         # expand the shape
         bsize = state.shape[0]
         device = state.device
         if isinstance(idx, int):
-            idx = torch.tensor(idx).expand(bsize)
+            idx = torch.full((), idx, device=device).expand(bsize)
         # build parameters
-        if self.config.noise_anneal:
-            # noise annealing
-            noise_start, noise_end, anneal_steps = self.config.noise_params
-            noise_level = (
-                noise_start
-                + (noise_end - noise_start)
-                * min(self.global_step, anneal_steps)
-                / anneal_steps
-            )
-            noise_level = torch.tensor(noise_level).to(device)
-        else:
-            # fixed noise level
-            noise_level = torch.tensor(self.config.noise_level).to(device)
-        timesteps = torch.linspace(1, 1 / denoise_steps, denoise_steps, device=device)
-        timesteps = torch.cat([timesteps, torch.tensor([0.0], device=device)])
+        noise_level = self._get_noise_level(device=device, dtype=x_t.dtype)
+        timesteps = self._get_timesteps(denoise_steps, device)
         # input parameters
         t_input = timesteps[idx]
         delta = timesteps[idx] - timesteps[idx + 1]
         # velocity prediction
-        suffix_out = self.get_suffix_out(
-            state,
-            prefix_pad_masks,
-            past_key_values,
-            x_t,
-            t_input,
+        v_t, suffix_out = self.get_velocity(
+            state, x_t, t_input, prefix_pad_masks, past_key_values
         )
-        v_t = self.action_out_proj(
-            suffix_out.to(dtype=self.action_out_proj.weight.dtype)
-        )  # [bs,n_action_steps,max_action_dim]
         # value prediction
         if (
             self.config.add_value_head
             and compute_values
             and not self.config.value_after_vlm
         ):
-            # use chunk critic input
-            if self.config.chunk_critic_input:
-                suffix_out_value = torch.mean(
-                    suffix_out[:, : self.config.action_chunk], dim=1, keepdim=False
-                )
-            else:
-                suffix_out_value = torch.mean(suffix_out, dim=1, keepdim=False)
-            # detach critic input
-            if self.config.detach_critic_input:
-                suffix_out_value = suffix_out_value.detach()
-            value_t = self.value_head(suffix_out_value)[:, 0]
+            value_t = self._compute_value_from_suffix(suffix_out)
         else:
             value_t = torch.zeros((bsize), device=device)
-        # ode sde mix sampling
+        # sample mean and variance
         delta = delta[:, None, None].expand_as(x_t)
         t_input = t_input[:, None, None].expand_as(x_t)
         x0_pred = x_t - v_t * t_input
         x1_pred = x_t + v_t * (1 - t_input)
-        if mode == "eval":
+
+        if sample_method == "flow_ode":
             x0_weight = 1 - (t_input - delta)
             x1_weight = t_input - delta
             x_t_std = torch.zeros_like(t_input)
-        elif mode == "train":
-            if self.config.noise_method == "flow_sde":
-                sigmas = (
-                    noise_level
-                    * torch.sqrt(
-                        timesteps
-                        / (1 - torch.where(timesteps == 1, timesteps[1], timesteps))
-                    )[:-1]
-                )
-                sigma_i = sigmas[idx][:, None, None].expand_as(x_t)
-                x0_weight = torch.ones_like(t_input) - (t_input - delta)
-                x1_weight = t_input - delta - sigma_i**2 * delta / (2 * t_input)
-                x_t_std = torch.sqrt(delta) * sigma_i
-            elif self.config.noise_method == "flow_cps":
-                pi = torch.pi
-                cos_term = torch.cos(pi * noise_level / 2).to(device)
-                sin_term = torch.sin(pi * noise_level / 2).to(device)
-                x0_weight = torch.ones_like(t_input) - (t_input - delta)
-                x1_weight = (t_input - delta) * cos_term
-                x_t_std = (t_input - delta) * sin_term
-            elif self.config.noise_method == "flow_noise":
-                x0_weight = 1 - (t_input - delta)
-                x1_weight = t_input - delta
-                x_t_std = self.noise_head(
-                    suffix_out.to(dtype=self.action_out_proj.weight.dtype)
-                )
-            else:
-                raise ValueError(f"Invalid noise method: {self.config.noise_method}")
+        elif sample_method == "flow_sde":
+            denom_timesteps = torch.where(timesteps == 1, timesteps[1], timesteps)
+            sigma_ratio = timesteps / (1 - denom_timesteps)
+            sigmas = noise_level * torch.sqrt(sigma_ratio)[:-1]
+            sigma_i = sigmas[idx][:, None, None].expand_as(x_t)
+            x0_weight = torch.ones_like(t_input) - (t_input - delta)
+            x1_weight = t_input - delta - sigma_i**2 * delta / (2 * t_input)
+            x_t_std = torch.sqrt(delta) * sigma_i
+        elif sample_method == "flow_cps":
+            pi = torch.pi
+            cos_term = torch.cos(pi * noise_level / 2).to(device)
+            sin_term = torch.sin(pi * noise_level / 2).to(device)
+            x0_weight = torch.ones_like(t_input) - (t_input - delta)
+            x1_weight = (t_input - delta) * cos_term
+            x_t_std = (t_input - delta) * sin_term
+        elif sample_method == "flow_noise":
+            x0_weight = 1 - (t_input - delta)
+            x1_weight = t_input - delta
+            x_t_std = self.noise_head(suffix_out)
+        else:
+            raise ValueError(f"Invalid noise method: {sample_method}")
         x_t_mean = x0_pred * x0_weight + x1_pred * x1_weight
-        return x_t_mean, x_t_std, value_t
+        return x_t_mean, x_t_std, value_t, v_t
 
     def get_suffix_out(
         self,
@@ -649,6 +1200,44 @@ class OpenPi0ForRLActionPrediction(BasePolicy, PI0Pytorch):
         suffix_out = suffix_out.to(dtype=torch.float32)
         return suffix_out
 
+    def get_velocity(self, state, x_t, timestep, prefix_pad_masks, past_key_values):
+        """Compute velocity prediction v_t and raw suffix_out at a given timestep."""
+        suffix_out = self.get_suffix_out(
+            state, prefix_pad_masks, past_key_values, x_t, timestep
+        )
+        v_t = self.action_out_proj(suffix_out)
+        return v_t, suffix_out
+
+    def _build_prefix_cache(self, images, img_masks, lang_tokens, lang_masks):
+        """Embed prefix tokens and compute KV cache for efficient suffix generation."""
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks
+        )
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+        (prefix_output, _), past_key_values = self.paligemma_with_expert.forward(
+            attention_mask=prefix_att_2d_masks_4d,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=True,
+        )
+        return prefix_output, prefix_pad_masks, past_key_values
+
+    def _compute_value_from_suffix(self, suffix_out):
+        """Compute value from suffix output using value head."""
+        if self.config.chunk_critic_input:
+            suffix_out_value = torch.mean(
+                suffix_out[:, : self.config.action_chunk], dim=1, keepdim=False
+            )
+        else:
+            suffix_out_value = torch.mean(suffix_out, dim=1, keepdim=False)
+        if self.config.detach_critic_input:
+            suffix_out_value = suffix_out_value.detach()
+        return self.value_head(suffix_out_value)[:, 0]
+
     # TODO: to check potential nan here
     def get_logprob_norm(self, sample, mu, sigma):
         # logprob = log p(x|mu,sigma) = -log(sigma) - 0.5 * log(2 * pi) - 0.5 * ((x - mu) / sigma) ** 2
@@ -680,23 +1269,9 @@ class OpenPi0ForRLActionPrediction(BasePolicy, PI0Pytorch):
         compute_values=False,
     ):
         bsize = state.shape[0]
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+        batch_indices = torch.arange(bsize)
+        prefix_output, prefix_pad_masks, past_key_values = self._build_prefix_cache(
             images, img_masks, lang_tokens, lang_masks
-        )
-        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-
-        # Compute image and language key value cache
-        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
-        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
-
-        # Compute image and language key value cache
-        [prefix_output, _], past_key_values = self.paligemma_with_expert.forward(
-            attention_mask=prefix_att_2d_masks_4d,
-            position_ids=prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
-            use_cache=True,
         )
         chains_log_probs = []
         chains_values = []
@@ -717,15 +1292,15 @@ class OpenPi0ForRLActionPrediction(BasePolicy, PI0Pytorch):
             num_steps = 1
         for idx in range(num_steps):
             denoise_ind = denoise_inds[:, idx]
-            chains_pre = chains[torch.arange(bsize), denoise_ind]
-            chains_next = chains[torch.arange(bsize), denoise_ind + 1]
-            x_t_mean, x_t_std, value_t = self.sample_mean_var_val(
+            chains_pre = chains[batch_indices, denoise_ind]
+            chains_next = chains[batch_indices, denoise_ind + 1]
+            x_t_mean, x_t_std, value_t, _ = self.sample_mean_var_val(
                 chains_pre,
                 denoise_ind,
                 state,
                 prefix_pad_masks,
                 past_key_values,
-                "train",
+                self.config.noise_method,
                 self.config.num_steps,
                 compute_values,
             )
@@ -733,10 +1308,10 @@ class OpenPi0ForRLActionPrediction(BasePolicy, PI0Pytorch):
             entropy = self.gaussian_entropy(x_t_std)
             chains_log_probs.append(log_probs)
             chains_entropy.append(entropy)
-            if self.use_vlm_value:
-                chains_values.append(self.get_value_from_vlm(prefix_output))
-            else:
+            if not self.use_vlm_value:
                 chains_values.append(value_t)
+        if self.use_vlm_value:
+            chains_values.append(self.get_value_from_vlm(prefix_output))
         chains_log_probs = torch.stack(chains_log_probs, dim=1)
         chains_values = torch.stack(chains_values, dim=1)
 
@@ -783,6 +1358,395 @@ class OpenPi0ForRLActionPrediction(BasePolicy, PI0Pytorch):
 
     def freeze_vlm(self):
         if self.config.train_expert_only:
+            # Base freeze: paligemma (SigLIP vision encoder + Gemma)
             self.paligemma_with_expert.paligemma.eval()
             for params in self.paligemma_with_expert.paligemma.parameters():
                 params.requires_grad = False
+
+            # ========== DSRL additional freezing ==========
+            if self.config.use_dsrl:
+                self.logger.info(
+                    "[FREEZE_VLM] DSRL mode: freezing gemma_expert parameters"
+                )
+                self.paligemma_with_expert.gemma_expert.eval()
+                for params in self.paligemma_with_expert.gemma_expert.parameters():
+                    params.requires_grad = False
+
+                # Freeze projection layers (used in rollout/eval but not optimized).
+                # Pi0 has: action_in_proj, action_out_proj, state_proj, action_time_mlp_in/out
+                # Pi0.5 has: action_in_proj, action_out_proj, time_mlp_in/out (no state_proj)
+                self.logger.info(
+                    "[FREEZE_VLM] DSRL mode: freezing projection layers (used in rollout/eval but not optimized)"
+                )
+                if self.pi05:
+                    projection_names = [
+                        "action_in_proj",
+                        "action_out_proj",
+                        "time_mlp_in",
+                        "time_mlp_out",
+                    ]
+                else:
+                    projection_names = [
+                        "action_in_proj",
+                        "action_out_proj",
+                        "state_proj",
+                        "action_time_mlp",
+                    ]
+                frozen_count = 0
+                for name, param in self.named_parameters():
+                    if any(proj_name in name for proj_name in projection_names):
+                        param.requires_grad = False
+                        frozen_count += 1
+                        if frozen_count <= 10:  # Print first 10 for brevity
+                            self.logger.info(f"  Froze: {name}")
+                if frozen_count > 10:
+                    self.logger.info(
+                        f"  ... and {frozen_count - 10} more projection layer parameters"
+                    )
+
+                # Freeze reinflow_explore_noise_net (only used in reinflow diffuser sampling)
+                if hasattr(self, "reinflow_explore_noise_net"):
+                    self.logger.info(
+                        "[FREEZE_VLM] DSRL mode: freezing reinflow_explore_noise_net (used in non-DSRL rollout but not optimized)"
+                    )
+                    self.reinflow_explore_noise_net.eval()
+                    noise_net_params = 0
+                    for params in self.reinflow_explore_noise_net.parameters():
+                        params.requires_grad = False
+                        noise_net_params += params.numel()
+                    self.logger.info(
+                        f"  Froze {noise_net_params:,} parameters in reinflow_explore_noise_net"
+                    )
+
+    # ===== DSRL-specific methods =====
+
+    def sac_forward(
+        self, obs=None, data=None, train=False, return_dist_params=False, **kwargs
+    ):
+        """SAC forward pass for DSRL.
+
+        Args:
+            obs: Observation dict (preferred, matches sac_dsrl).
+                 Supports two formats:
+                   1. {"images": list of tensors, "states": tensor} - internal format
+                   2. {"main_images": tensor, "wrist_images": tensor, "states": tensor} - env format
+            data: Dictionary containing observations (legacy, for backward compatibility).
+            train: Whether to use data augmentation.
+            return_dist_params: Whether to return distribution parameters for logging.
+
+        Returns:
+            actions: [B, action_horizon, output_dim] - noise or actual actions
+            logprobs: [B] - log probabilities
+            dist_params: (mean, std) or None - distribution parameters for logging
+        """
+        if not self.config.use_dsrl:
+            raise ValueError("sac_forward called but use_dsrl=False")
+
+        # Support both call styles: obs (new, from sac_dsrl) or data (legacy)
+        if obs is None:
+            obs = data.get("obs", data) if data is not None else kwargs.get("obs", {})
+
+        # Handle two obs formats:
+        # Format 1 (internal): {"images": [...], "states": ...}
+        # Format 2 (env): {"main_images": ..., "wrist_images": ..., "states": ...}
+        if "images" not in obs:
+            # Convert env format to internal format
+            if "main_images" in obs:
+                obs = {"images": [obs["main_images"]], "states": obs["states"]}
+            else:
+                raise ValueError(
+                    f"Invalid obs format: {obs.keys()}. Expected 'images' or 'main_images' key."
+                )
+
+        # Preprocess images: resize to 64x64, use only agentview camera
+        # Returns [B, 1, C, 64, 64] in [-1, 1] range (float32)
+        images = self._preprocess_dsrl_images(obs["images"], train=train)
+        states = self._preprocess_states(obs["states"])
+
+        # Move to the same device as actor encoders, convert to bfloat16
+        device = next(self.actor_image_encoder.parameters()).device
+        images = images.to(device=device, dtype=torch.bfloat16)
+        states = states.to(device=device, dtype=torch.bfloat16)
+
+        # Extract features (using actor's independent encoder)
+        image_features = self.actor_image_encoder(images)  # [B, 64]
+        state_features = self.actor_state_encoder(states)  # [B, 64]
+        features = torch.cat([state_features, image_features], dim=-1)  # [B, 128]
+
+        # Sample from GaussianPolicy
+        mode = kwargs.get("mode", "train")
+        deterministic = mode == "eval"
+
+        action_noise, logprobs = self.dsrl_action_noise_net.sample(
+            features, deterministic=deterministic
+        )
+
+        # Optional: return distribution parameters for logging
+        dist_params = None
+        if return_dist_params:
+            dist = self.dsrl_action_noise_net.forward(features)
+            dist_params = (dist.mean, dist.stddev)
+
+        return action_noise, logprobs, dist_params
+
+    def sac_q_forward(
+        self,
+        obs=None,
+        data=None,
+        actions=None,
+        detach_encoder=False,
+        train=False,
+        **kwargs,
+    ):
+        """Q-value forward pass for DSRL.
+
+        Args:
+            obs: Observation dict (preferred, matches sac_dsrl).
+                 Supports two formats:
+                   1. {"images": list of tensors, "states": tensor} - internal format
+                   2. {"main_images": tensor, "wrist_images": tensor, "states": tensor} - env format
+            data: Dictionary containing observations (legacy, for backward compatibility).
+            actions: [B, action_dim] or [B, action_horizon, action_dim]
+            detach_encoder: Whether to detach encoder gradients.
+            train: Whether to use data augmentation.
+
+        Returns:
+            q_values: [B, num_q_heads] - Q-values from all Q-networks.
+        """
+        if not self.config.use_dsrl:
+            raise ValueError("sac_q_forward called but use_dsrl=False")
+
+        # Support both call styles: obs (new, from sac_dsrl) or data (legacy)
+        if obs is None:
+            obs = data.get("obs", data) if data is not None else kwargs.get("obs", {})
+        if actions is None:
+            actions = kwargs.get("actions")
+
+        # Handle two obs formats:
+        # Format 1 (internal): {"images": [...], "states": ...}
+        # Format 2 (env): {"main_images": ..., "wrist_images": ..., "states": ...}
+        if "images" not in obs:
+            # Convert env format to internal format
+            if "main_images" in obs:
+                obs = {"images": [obs["main_images"]], "states": obs["states"]}
+            else:
+                raise ValueError(
+                    f"Invalid obs format: {obs.keys()}. Expected 'images' or 'main_images' key."
+                )
+
+        # Preprocess images: resize to 64x64, use only agentview camera
+        # Returns [B, 1, C, 64, 64] in [-1, 1] range (float32)
+        images = self._preprocess_dsrl_images(obs["images"], train=train)
+        states = self._preprocess_states(obs["states"])
+
+        # Move to the same device as critic encoders, convert to bfloat16
+        device = next(self.critic_image_encoder.parameters()).device
+        images = images.to(device=device, dtype=torch.bfloat16)
+        states = states.to(device=device, dtype=torch.bfloat16)
+        actions = actions.to(device=device, dtype=torch.bfloat16)
+
+        # Extract features (using critic's independent encoder)
+        image_features = self.critic_image_encoder(images)
+        state_features = self.critic_state_encoder(states)
+
+        # Optionally detach encoder
+        if detach_encoder:
+            image_features = image_features.detach()
+            state_features = state_features.detach()
+
+        # Process actions (DSRL: should be noise, already flattened)
+        if actions.dim() == 3:
+            actions = actions[:, 0, :]  # [B, action_horizon, dim] -> [B, dim]
+
+        # Compute Q values
+        q_values = self.q_head(state_features, image_features, actions)
+
+        return q_values
+
+    # ===== NFT-specific methods =====
+
+    def _init_nft_state(
+        self,
+        collect_nft_state: bool,
+        x_t: torch.Tensor,
+        num_steps: int,
+        device: torch.device,
+    ) -> dict[str, torch.Tensor] | None:
+        """Initialize NFT state buffers for rollout sampling."""
+        if not collect_nft_state:
+            return None
+        return {
+            "nft_step_index": torch.randint(
+                0, num_steps, (x_t.shape[0],), device=device
+            ),
+            "nft_xcur": torch.zeros_like(x_t),
+            "nft_v": torch.zeros_like(x_t),
+            "nft_xnext": torch.zeros_like(x_t),
+            "nft_noise_level": torch.zeros(
+                x_t.shape[0], device=device, dtype=x_t.dtype
+            ),
+        }
+
+    def _update_nft_state(
+        self,
+        nft_state: dict[str, torch.Tensor] | None,
+        idx: int,
+        x_t_prev: torch.Tensor,
+        v_t: torch.Tensor,
+        x_t: torch.Tensor,
+        sample_method: str,
+    ) -> None:
+        """Update NFT state buffers for the selected denoising step."""
+        if nft_state is None:
+            return
+        mask = nft_state["nft_step_index"] == idx
+        if not mask.any():
+            return
+        mask_bc = mask[:, None, None]
+        nft_state["nft_xcur"] = torch.where(
+            mask_bc, x_t_prev.detach(), nft_state["nft_xcur"]
+        )
+        nft_state["nft_v"] = torch.where(mask_bc, v_t.detach(), nft_state["nft_v"])
+        nft_state["nft_xnext"] = torch.where(
+            mask_bc, x_t.detach(), nft_state["nft_xnext"]
+        )
+        noise_level = self._get_noise_level(
+            device=x_t.device, dtype=x_t.dtype, sample_method=sample_method
+        )
+        nft_state["nft_noise_level"] = torch.where(
+            mask,
+            torch.full_like(nft_state["nft_noise_level"], float(noise_level.item())),
+            nft_state["nft_noise_level"],
+        )
+
+    def _get_noise_level(
+        self, device: torch.device, dtype: torch.dtype, sample_method: str | None = None
+    ) -> torch.Tensor:
+        method = sample_method or self.config.noise_method
+        if method == "flow_ode":
+            return torch.zeros((), device=device, dtype=dtype)
+        if self.config.noise_anneal:
+            noise_start, noise_end, anneal_steps = self.config.noise_params
+            noise_level = (
+                noise_start
+                + (noise_end - noise_start)
+                * min(self.global_step, anneal_steps)
+                / anneal_steps
+            )
+        else:
+            noise_level = self.config.noise_level
+        return torch.full((), noise_level, device=device, dtype=dtype)
+
+    def _preprocess_dsrl_images(self, images, train=False):
+        """Preprocess images for DSRL: resize to 64x64, use only agentview camera.
+
+        Args:
+            images: List of tensors.
+                Can be [B, H, W, C] (NHWC) from environment or
+                [B, C, H, W] (NCHW) from processed data.
+                For Libero: images[0] is agentview, images[1] is wrist.
+            train: Whether to use data augmentation (placeholder for now).
+
+        Returns:
+            Tensor of shape [B, 1, C, 64, 64] - only agentview, resized, in [-1, 1].
+        """
+
+        # Extract only agentview camera (first image in the list)
+        if isinstance(images, list):
+            agentview_img = images[0]
+        else:
+            # Assume it's already a tensor
+            agentview_img = images
+
+        # Detect and convert NHWC -> NCHW (environment outputs NHWC)
+        if agentview_img.shape[-1] == 3:
+            # NHWC format: [B, H, W, C] -> [B, C, H, W]
+            agentview_img = agentview_img.permute(0, 3, 1, 2)
+
+        B, C, H, W = agentview_img.shape
+        target_size = 64
+
+        # ===== UNIFIED VALUE RANGE HANDLING =====
+        # Convert to float32 and normalize to [0, 1] for PyTorch resize
+        if agentview_img.dtype == torch.uint8:
+            # [0, 255] -> [0, 1]
+            agentview_img = agentview_img.float() / 255.0
+        else:
+            # Check if in [-1, 1] range
+            if agentview_img.min() < 0:
+                # [-1, 1] -> [0, 1]
+                agentview_img = (agentview_img + 1.0) / 2.0
+            # else: already in [0, 1] range, assume correctly normalized
+        # ===========================================
+
+        # Clamp to ensure valid range
+        agentview_img = agentview_img.clamp(0.0, 1.0)
+
+        # ===== GPU-ACCELERATED RESIZE (aligned with PIL behavior) =====
+        # PyTorch bilinear with align_corners=False approximates PIL's behavior
+        resized_img = F.interpolate(
+            agentview_img,
+            size=(target_size, target_size),
+            mode="bilinear",
+            align_corners=False,
+        )
+        # =============================================================
+
+        # Convert back to [-1, 1] range (to match PIL-based pipeline)
+        resized_img = resized_img * 2.0 - 1.0  # [0, 1] -> [-1, 1]
+
+        # Add num_images dimension: [B, C, 64, 64] -> [B, 1, C, 64, 64]
+        resized_img = resized_img.unsqueeze(1)
+
+        return resized_img
+
+    def _preprocess_states(self, states):
+        """
+        Preprocess states: flatten to 2D and convert to bfloat16.
+
+        Args:
+            states: [B, ...] any shape
+
+        Returns:
+            states: [B, state_dim] flattened states as bfloat16
+        """
+        if states.dim() > 2:
+            states = states.reshape(states.shape[0], -1)
+        # Convert to bfloat16 to match encoder's dtype
+        if states.dtype != torch.bfloat16:
+            states = states.to(torch.bfloat16)
+        return states
+
+    def enable_torch_compile(
+        self,
+        mode: str = "max-autotune",
+    ):
+        if self.torch_compile_enabled:
+            return
+
+        self.paligemma_with_expert.paligemma.model.vision_tower.forward = torch.compile(
+            self.paligemma_with_expert.paligemma.model.vision_tower.forward, mode=mode
+        )
+
+        # NOTE: paligemma.model.language_model and gemma_expert.model share the same LLM backbone.
+        # Enabling cuda graph on both simultaneously causes mysterious crashes (likely due to
+        # tensor aliasing in the shared computation graph). We disable cuda graph for
+        # paligemma.model.language_model since it is not CPU-bound, while gemma_expert.model
+        # benefits more from cuda graph.
+        self.paligemma_with_expert.paligemma.model.language_model.forward = (
+            torch.compile(
+                self.paligemma_with_expert.paligemma.model.language_model.forward,
+                mode="max-autotune-no-cudagraphs" if mode == "max-autotune" else mode,
+            )
+        )
+        self.paligemma_with_expert.gemma_expert.model.forward = torch.compile(
+            self.paligemma_with_expert.gemma_expert.model.forward,
+            mode=mode,
+            fullgraph=True,
+        )
+        self.get_logprob_norm = torch.compile(
+            self.get_logprob_norm,
+            mode="max-autotune-no-cudagraphs" if mode == "max-autotune" else mode,
+        )
+
+        self.torch_compile_enabled = True

@@ -12,8 +12,13 @@ build
 docs/build
 dist
 logs/*
+logs_baseline/*
 outputs/*
 *.so
 .venv
+.docs-venv
 uv.lock
 rlinf/envs/maniskill/assets
+PKG-INFO
+*.egg-info/
+.claude/settings.json
