@@ -278,6 +278,11 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             setattr(module, "_fsdp_wrap_name", path_parts[-1] if path_parts else name)
 
         self.torch_compile_enabled = False
+        # SSRL language anchor (optional, lazy): only instantiated when
+        # ``config.ssrl.enable`` is set and ``predict_action_batch`` runs
+        # (rollout side).  Lives outside the module parameter set, so it
+        # never enters weight sync / FSDP (plan §8.3 #9).
+        self._ssrl_lang_encoder = None
 
     def set_global_step(self, global_step):
         self.global_step = global_step
@@ -902,6 +907,21 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         if forward_action is not None:
             forward_inputs["action"] = forward_action
 
+        # SSRL extras (optional keys; absent when disabled).
+        # - lang_emb: frozen CLIP text embedding of the raw instruction,
+        #   [B, 512] fp32 L2-normalized.  The actor cannot see instruction
+        #   strings (plan §3.2), so the rollout side pre-computes it here.
+        # - scene_obs: raw CALVIN scene state [B, 24] for the pose-space
+        #   curiosity branch (plan §3.3 B).
+        # Neither enters weight sync.
+        if self._ssrl_enabled():
+            lang_emb = self._maybe_compute_lang_emb(env_obs)
+            if lang_emb is not None:
+                forward_inputs["lang_emb"] = lang_emb
+            scene_obs = env_obs.get("scene_obs")
+            if scene_obs is not None:
+                forward_inputs["scene_obs"] = torch.as_tensor(scene_obs).float()
+
         if self.config.is_nft:
             nft_outputs = {
                 key: value for key, value in outputs.items() if key.startswith("nft_")
@@ -920,6 +940,49 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             "forward_inputs": forward_inputs,
         }
         return actions, result
+
+    def _ssrl_enabled(self) -> bool:
+        """Whether the optional SSRL hooks are active (plan §3.2 / §3.3)."""
+        ssrl_cfg = getattr(self.config, "ssrl", None)
+        return bool(ssrl_cfg is not None and getattr(ssrl_cfg, "enable", False))
+
+    def _maybe_compute_lang_emb(
+        self, env_obs: dict,
+    ) -> torch.Tensor | None:
+        """Compute the SSRL language anchor for the current batch, or None.
+
+        No-op unless ``config.ssrl.enable`` is true (the config key is set
+        via the ``actor.model.openpi.ssrl`` yaml section, which overrides
+        ``OpenPi0Config``).  The CLIP text encoder is created lazily so
+        ``enable=false`` never touches the transformers/r3m dependencies,
+        and the frozen encoder is cached per instruction string (CALVIN's
+        instruction set is small, so the hit rate is high).
+        """
+        if not self._ssrl_enabled():
+            return None
+        ssrl_cfg = getattr(self.config, "ssrl", None)
+        if self._ssrl_lang_encoder is None:
+            from rlinf.ssrl.encoder import CLIPTextEncoder  # lazy
+
+            lang_cfg = getattr(ssrl_cfg, "language", None)
+            model_name = (
+                getattr(lang_cfg, "model", None)
+                if lang_cfg is not None
+                else None
+            ) or "openai/clip-vit-base-patch32"
+            device = next(self.parameters()).device
+            self._ssrl_lang_encoder = CLIPTextEncoder(
+                model_name=model_name, device=device
+            )
+        texts = env_obs.get("task_descriptions")
+        # CALVIN initializes ``task_descriptions`` to [None]*num_envs and
+        # only fills entries on reset; feeding None to the CLIP tokenizer
+        # raises.  Skip the anchor for this step rather than crashing the
+        # rollout worker.
+        if texts is None or any(t is None for t in texts):
+            return None
+        emb = self._ssrl_lang_encoder.encode_cached(list(texts))  # [B, 512]
+        return emb.to(next(self.parameters()).device)
 
     @torch.no_grad()
     def sample_actions(

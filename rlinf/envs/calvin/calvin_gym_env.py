@@ -267,6 +267,10 @@ class CalvinEnv(gym.Env):
             "full_image": img,
             "wrist_image": wrist_img,
             "state": state,
+            # 24-d object/drawer/switch states, consumed only by the SSRL
+            # pose-space curiosity branch (plan §3.3 B); a tiny inert extra
+            # key for every other consumer.
+            "scene_obs": obs["scene_obs"],
         }
 
     def _wrap_obs(self, obs_list):
@@ -287,10 +291,15 @@ class CalvinEnv(gym.Env):
         )
         states = images_and_states["state"]
 
+        scene_obs_tensor = torch.stack(
+            [value.clone() for value in images_and_states["scene_obs"]]
+        )
+
         obs = {
             "main_images": full_image_tensor,
             "wrist_images": wrist_image_tensor,
             "states": states,
+            "scene_obs": scene_obs_tensor,
             "task_descriptions": self.task_descriptions,
         }
 

@@ -117,6 +117,10 @@ class EnvOutput:
             if "task_descriptions" in obs and obs["task_descriptions"] is not None
             else None
         )
+        # CALVIN low-dim scene state (24-d), consumed only by the SSRL
+        # pose-space curiosity branch (plan §3.3 B); inert passthrough key
+        # for every other env/consumer (None when absent).
+        scene_obs = obs["scene_obs"] if "scene_obs" in obs else None
 
         return {
             "main_images": image_tensor,  # [N_ENV, H, W, C]
@@ -124,6 +128,7 @@ class EnvOutput:
             "extra_view_images": extra_view_image_tensor,  # [N_ENV, N_IMG, H, W, C]
             "states": states,
             "task_descriptions": task_descriptions,
+            "scene_obs": scene_obs,  # [N_ENV, 24] float; None for non-CALVIN envs
         }
 
     @staticmethod

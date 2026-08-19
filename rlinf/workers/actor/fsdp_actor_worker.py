@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import time
 from functools import partial
 from typing import Optional
@@ -1115,6 +1116,13 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             range(self._component_placement.get_world_size("rollout"))
         )
 
+        # SSRL intrinsic rewards (optional, zero behavior when disabled).
+        ssrl_cfg = OmegaConf.select(cfg, "algorithm.ssrl", default=None)
+        self.ssrl_enabled = bool(
+            ssrl_cfg is not None and ssrl_cfg.get("enable", False)
+        )
+        self.ssrl = None
+
     def init_worker(self) -> None:
         """
         Initialize the actor worker. build the model and use corresponding training backend,
@@ -1125,6 +1133,48 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         if self.enable_offload:
             self.offload_param_and_grad()
             self.offload_optimizer()
+
+        if self.ssrl_enabled:
+            # Lazy import keeps the actor module light when SSRL is off.
+            # SSRLModule lives on the actor's local GPU, fp32, outside FSDP /
+            # weight sync (plan §5.3).  Instantiating it requires the SSRL
+            # deps (r3m / transformers) to be installed — authorized
+            # separately (plan §6); otherwise this raises a clear error.
+            from rlinf.ssrl.module import SSRLModule  # noqa: PLC0415
+
+            ssrl_cfg = OmegaConf.select(self.cfg, "algorithm.ssrl")
+            self.ssrl = SSRLModule(ssrl_cfg, self.device)
+            self.log_info("SSRL enabled: intrinsic rewards injected before GAE.")
+
+    def save_checkpoint(self, save_path: str, step: int = 0) -> None:
+        """Save the actor checkpoint plus the optional SSRL state (rank 0)."""
+        super().save_checkpoint(save_path, step)
+        if self.ssrl is not None and self._rank == 0:
+            state_path = os.path.join(os.path.dirname(save_path), "ssrl_state.pt")
+            torch.save(self.ssrl.state_dict(), state_path)
+            self.log_info(f"SSRL state saved to {state_path}")
+
+    def load_checkpoint(self, load_path: str) -> None:
+        """Load the actor checkpoint and, if present, the SSRL state.
+
+        Missing ``ssrl_state.pt`` is not fatal: the module re-initializes
+        (plan §5.3) but the RMS statistics are reset, so the intrinsic
+        reward scale may shift after resume — logged as a warning.
+        """
+        super().load_checkpoint(load_path)
+        if self.ssrl is not None:
+            state_path = os.path.join(os.path.dirname(load_path), "ssrl_state.pt")
+            if os.path.exists(state_path):
+                state = torch.load(
+                    state_path, map_location=self.device, weights_only=False
+                )
+                self.ssrl.load_state_dict(state)
+                self.log_info(f"SSRL state loaded from {state_path}")
+            else:
+                self.log_warning(
+                    f"ssrl_state.pt not found next to {load_path}; "
+                    "SSRL re-initialized (RMS statistics reset)."
+                )
 
     def model_provider_func(self) -> nn.Module:
         model = get_model(self.cfg.actor.model)
@@ -1300,6 +1350,19 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         """
         Compute the advantages and returns.
         """
+        # SSRL intrinsic rewards: inject BEFORE GAE, directly into the
+        # [T, B, C] rewards (plan §3.1 / §3.5).  The chunk_level sum in
+        # ``preprocess_embodied_advantages_inputs`` runs afterwards, so the
+        # per-chunk-frame deltas are conserved.  No-op when disabled.
+        ssrl_metrics = {}
+        if self.ssrl is not None:
+            intrinsic, ssrl_metrics = self.ssrl.compute_intrinsic_rewards(
+                self.rollout_batch
+            )
+            self.rollout_batch["rewards"] = (
+                self.rollout_batch["rewards"] + self.ssrl.rho * intrinsic
+            )
+
         if self.cfg.algorithm.adv_type == "opd":
             self.compute_opd_teacher_logprobs()
 
@@ -1329,6 +1392,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.rollout_batch.update({"loss_mask_sum": kwargs["loss_mask_sum"]})
 
         rollout_metrics = compute_rollout_metrics(self.rollout_batch)
+        if ssrl_metrics:
+            rollout_metrics.update(ssrl_metrics)
         return rollout_metrics
 
     @Worker.timer("actor/compute_opd_teacher_logprobs")
@@ -1523,6 +1588,10 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         g.manual_seed(self.cfg.actor.seed + self._rank)
         shuffle_id = torch.randperm(rollout_size, generator=g)
 
+        # Keep the pre-shuffle [T, B, ...] batch for the SSRL pretext update
+        # (time adjacency inside each episode must be preserved there).
+        ssrl_pretext_batch = self.rollout_batch if self.ssrl is not None else None
+
         with torch.no_grad():
             self.rollout_batch = process_nested_dict_for_train(
                 self.rollout_batch, shuffle_id
@@ -1586,6 +1655,15 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         clear_memory()
         explained_variance_stats = pop_critic_explained_variance_stats(metrics)
         mean_metric_dict = {key: np.mean(value) for key, value in metrics.items()}
+        if ssrl_pretext_batch is not None:
+            # SSRL pretext update AFTER the PPO training loop (plan §3.5):
+            # InfoNCE + language alignment + ICM forward loss, on the actor's
+            # local module with its own optimizer.  No-op when disabled.
+            # Merged BEFORE the all-reduce below so that ssrl metrics are
+            # world-averaged like every other metric (they are plain floats,
+            # which all_reduce_dict accepts) instead of being rank-local.
+            pretext_metrics = self.ssrl.update_pretext(ssrl_pretext_batch)
+            mean_metric_dict.update(pretext_metrics)
         mean_metric_dict = all_reduce_dict(
             mean_metric_dict, op=torch.distributed.ReduceOp.AVG
         )
