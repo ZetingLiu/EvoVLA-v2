@@ -1118,9 +1118,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         # SSRL intrinsic rewards (optional, zero behavior when disabled).
         ssrl_cfg = OmegaConf.select(cfg, "algorithm.ssrl", default=None)
-        self.ssrl_enabled = bool(
-            ssrl_cfg is not None and ssrl_cfg.get("enable", False)
-        )
+        self.ssrl_enabled = bool(ssrl_cfg is not None and ssrl_cfg.get("enable", False))
         self.ssrl = None
 
     def init_worker(self) -> None:
@@ -1150,9 +1148,23 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         """Save the actor checkpoint plus the optional SSRL state (rank 0)."""
         super().save_checkpoint(save_path, step)
         if self.ssrl is not None and self._rank == 0:
-            state_path = os.path.join(os.path.dirname(save_path), "ssrl_state.pt")
-            torch.save(self.ssrl.state_dict(), state_path)
+            state_path = self._ssrl_state_path(save_path)
+            torch.save(self.ssrl.ssrl_state_dict(), state_path)
             self.log_info(f"SSRL state saved to {state_path}")
+
+    @staticmethod
+    def _ssrl_state_path(actor_checkpoint_path: str) -> str:
+        """``<...>/global_step_N/actor`` -> ``<...>/global_step_N/ssrl_state.pt``.
+
+        ``normpath`` first so a trailing separator does not shift the result
+        one level down into the actor shard directory (review P1-9): the
+        runner builds this path with ``os.path.join`` today, but resume paths
+        come from user-supplied ``runner.resume_dir`` config.
+        """
+        return os.path.join(
+            os.path.dirname(os.path.normpath(actor_checkpoint_path)),
+            "ssrl_state.pt",
+        )
 
     def load_checkpoint(self, load_path: str) -> None:
         """Load the actor checkpoint and, if present, the SSRL state.
@@ -1163,12 +1175,12 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         """
         super().load_checkpoint(load_path)
         if self.ssrl is not None:
-            state_path = os.path.join(os.path.dirname(load_path), "ssrl_state.pt")
+            state_path = self._ssrl_state_path(load_path)
             if os.path.exists(state_path):
                 state = torch.load(
                     state_path, map_location=self.device, weights_only=False
                 )
-                self.ssrl.load_state_dict(state)
+                self.ssrl.load_ssrl_state(state)
                 self.log_info(f"SSRL state loaded from {state_path}")
             else:
                 self.log_warning(
@@ -1356,11 +1368,16 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         # per-chunk-frame deltas are conserved.  No-op when disabled.
         ssrl_metrics = {}
         if self.ssrl is not None:
+            from rlinf.ssrl.intrinsic import mix_intrinsic
+
             intrinsic, ssrl_metrics = self.ssrl.compute_intrinsic_rewards(
                 self.rollout_batch
             )
-            self.rollout_batch["rewards"] = (
-                self.rollout_batch["rewards"] + self.ssrl.rho * intrinsic
+            # Single mixing path shared with the unit tests (review P2-11):
+            # r_ext + rho * intrinsic, with the branches already summed by
+            # ``compute_intrinsic_rewards``.
+            self.rollout_batch["rewards"] = mix_intrinsic(
+                self.rollout_batch["rewards"], intrinsic, None, self.ssrl.rho
             )
 
         if self.cfg.algorithm.adv_type == "opd":

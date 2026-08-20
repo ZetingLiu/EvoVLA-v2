@@ -120,3 +120,30 @@ def test_info_nce_loss_shapes_match_pretext():
     loss = info_nce_loss(q, pos, neg[:, None, :], temperature=0.1)
     assert torch.isfinite(loss)
     assert loss.item() > 0.0
+
+
+def test_normalize_masked_scale_only_keeps_mse_nonnegative():
+    """P0-2 regression: forward-MSE branches are nonnegative; ``scale_only``
+    must not subtract the mean (``mean_std`` turns average-novelty steps
+    into a per-step penalty — seen in the 2026-08-18 smoke as
+    ``r_cur_norm=-0.0099``)."""
+    from rlinf.ssrl.intrinsic import normalize_masked
+
+    rms = RunningMeanStd()
+    x = torch.tensor([[0.0, 0.1], [0.4, 0.0], [0.0, 0.0]])  # MSE-like, >= 0
+    invalid = x == 0
+    out = normalize_masked(x, invalid, rms, mode="scale_only", clip=1.0)
+    assert (out[~invalid] >= 0).all()
+    assert (out[invalid] == 0).all()
+
+
+def test_normalize_masked_mean_std_makes_mse_negative():
+    """Documents why ``normalize_r_cur`` defaults to scale_only: with
+    ``mean_std``, valid entries below the batch mean go negative."""
+    from rlinf.ssrl.intrinsic import normalize_masked
+
+    rms = RunningMeanStd()
+    x = torch.tensor([[0.5, 1.5], [2.5, 3.5], [0.0, 0.0]])
+    invalid = torch.tensor([[False, False], [False, False], [True, True]])
+    out = normalize_masked(x, invalid, rms, mode="mean_std", clip=0.0)
+    assert (out[~invalid] < 0).any(), "mean_std must shift some entries below zero"

@@ -29,7 +29,6 @@ These tests pin the contract from both sides (pure CPU, no R3M weights):
   must fail loudly instead of silently mis-wiring.
 """
 
-import os
 import pathlib
 
 import pytest
@@ -77,8 +76,12 @@ def _fake_batch(T=4, B=2, C=5):
         "rewards": torch.zeros(T, B, C),
         "dones": torch.zeros(T + 1, B, C, dtype=torch.bool),
         "forward_inputs": {
-            "observation/image": torch.randint(0, 255, (T, B, 16, 16, 3), dtype=torch.uint8),
-            "observation/wrist_image": torch.randint(0, 255, (T, B, 8, 8, 3), dtype=torch.uint8),
+            "observation/image": torch.randint(
+                0, 255, (T, B, 16, 16, 3), dtype=torch.uint8
+            ),
+            "observation/wrist_image": torch.randint(
+                0, 255, (T, B, 8, 8, 3), dtype=torch.uint8
+            ),
             "lang_emb": torch.randn(T, B, 512),
             "action": torch.randn(T, B, 35),
             "scene_obs": torch.randn(T, B, 24),
@@ -95,9 +98,9 @@ def _make_module(monkeypatch, latent_dim: int):
     monkeypatch.setattr(
         R3MVisualEncoder, "_load_r3m_backend", staticmethod(lambda: _StubR3M2048())
     )
-    from rlinf.ssrl.module import SSRLModule
-
     from omegaconf import OmegaConf
+
+    from rlinf.ssrl.module import SSRLModule
 
     cfg = OmegaConf.create(
         {

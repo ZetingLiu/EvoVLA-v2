@@ -1086,7 +1086,51 @@ def validate_embodied_cfg(cfg):
                 assert cfg.env.train.base_config_name == "r1pro_behavior", (
                     f"Only r1pro_behavior is supported for omnigibson, got {cfg.env.train.base_config_name}"
                 )
+    _validate_ssrl_cfg(cfg, model_cfg, only_eval)
     return cfg
+
+
+def _validate_ssrl_cfg(cfg, model_cfg, only_eval: bool) -> None:
+    """Fail loudly on SSRL misconfiguration (review P1-6).
+
+    A desynced double-enable or a non-chunk reward layout silently degrades
+    SSRL into a plain baseline — hours of ABC->D training wasted without a
+    single metric going missing.  These checks only run when
+    ``algorithm.ssrl.enable`` is true; absent/dead SSRL config keeps the
+    original behavior.
+    """
+    ssrl = cfg.algorithm.get("ssrl") if cfg.algorithm is not None else None
+    if ssrl is None or not bool(ssrl.get("enable", False)):
+        return
+    if only_eval:
+        return  # eval does not compute intrinsic rewards
+
+    # Double enable: the actor reads algorithm.ssrl.enable, the rollout-side
+    # openpi hook reads actor.model.openpi.ssrl.enable (yaml interpolation).
+    openpi_ssrl = model_cfg.get("openpi", {}).get("ssrl", {})
+    if not bool(openpi_ssrl.get("enable", False)):
+        raise ValueError(
+            "algorithm.ssrl.enable=true but actor.model.openpi.ssrl.enable is "
+            "false — the rollout side will not write lang_emb/scene_obs and "
+            "SSRL silently degrades to baseline. Keep both enables in sync."
+        )
+    reward_type = cfg.algorithm.get("reward_type", None)
+    if reward_type != "chunk_level":
+        raise ValueError(
+            "algorithm.ssrl requires algorithm.reward_type == 'chunk_level' "
+            f"(intrinsic is filled into [T,B,C] before the chunk-dim sum), got {reward_type!r}."
+        )
+    if int(ssrl.get("num_action_chunks", -1)) != int(
+        model_cfg.get("num_action_chunks", -2)
+    ):
+        raise ValueError(
+            "algorithm.ssrl.num_action_chunks must equal "
+            "actor.model.num_action_chunks (chunk-fill shape contract)."
+        )
+    if float(ssrl.get("rho", 0.0)) < 0:
+        raise ValueError(
+            f"algorithm.ssrl.rho must be >= 0, got {float(ssrl.get('rho'))}"
+        )
 
 
 def validate_offline_cfg(cfg: DictConfig) -> DictConfig:

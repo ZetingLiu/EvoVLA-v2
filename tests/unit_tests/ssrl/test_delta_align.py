@@ -168,7 +168,7 @@ def test_lang_switch_no_diff(monkeypatch):
     Tested at the intrinsic level: a similarity sequence where the anchor
     changes between frames must produce zero delta at the switch frame.
     """
-    T, C = 6, 5
+    T = 6
     # lang_emb identical for t in [0, 1, 2], different from t=3 on.
     lang = torch.zeros(T, 1, 512)
     lang[:3] = 1.0 / (512**0.5)
@@ -181,9 +181,7 @@ def test_lang_switch_no_diff(monkeypatch):
     delta = s[1:] - s[:-1]
     # Switch at t=2 -> 3: delta must be zeroed there.
     switch_mask = (lang[:-1] * lang[1:]).sum(dim=-1) < 0.999  # [T-1]
-    safe_delta = torch.where(
-        switch_mask, torch.zeros_like(delta), delta
-    )
+    safe_delta = torch.where(switch_mask, torch.zeros_like(delta), delta)
     assert delta[2].item() != 0.0  # the switch delta is real, masking is tested
     torch.testing.assert_close(safe_delta[2], torch.zeros(1))
     torch.testing.assert_close(safe_delta[0], delta[0])

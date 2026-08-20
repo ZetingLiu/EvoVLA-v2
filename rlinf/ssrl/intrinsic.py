@@ -74,8 +74,7 @@ def boundary_mask_from_dones(dones: torch.Tensor, num_frames: int) -> torch.Tens
     """
     if dones.shape[0] < num_frames + 1:
         raise ValueError(
-            f"dones first dim must be >= T+1 ({num_frames + 1}), "
-            f"got {dones.shape[0]}"
+            f"dones first dim must be >= T+1 ({num_frames + 1}), got {dones.shape[0]}"
         )
     mask = dones[:num_frames].any(dim=-1).clone()  # [T, B]: transition into t
     if num_frames > 0:

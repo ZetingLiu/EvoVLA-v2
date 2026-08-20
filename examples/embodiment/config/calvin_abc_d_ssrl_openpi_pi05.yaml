@@ -73,11 +73,18 @@ algorithm:
     use_contrastive: true
     use_curiosity: true
     freeze_backbone: true       # #10=B: freeze R3M, train projection head only
-    freeze_encoder: false       # true = freeze projection head too (real robot default)
+    freeze_encoder: false       # true = freeze the projection head too (real-robot
+                                # default): only the ICM keeps training, so r_con
+                                # measures progress in a fixed metric space
     normalize_intrinsic: true
     normalize_r_con: mean_std   # optional scale_only (potential-shaping ablation)
+    normalize_r_cur: scale_only # r_cur is forward-MSE (nonnegative): mean_std would
+                                # turn average-novelty steps into a per-step penalty
     clip_intrinsic: 1.0
-    s_ema_beta: 0.0             # >0: EMA s_t before differencing (§8.3 #2)
+    # Peak-memory knob: frames per R3M forward when encoding the [T*B] stack.
+    encode_micro_batch: 256
+    s_ema_beta: 0.0             # NOT IMPLEMENTED (§8.3 #2 idea, kept as a
+                                # placeholder): s_t is differenced directly
     num_action_chunks: ${actor.model.num_action_chunks}
     encoder:
       backbone: r3m_resnet18
@@ -101,11 +108,17 @@ algorithm:
       action_mlp_dim: 128
       hidden_dim: 512
       forward_loss_coef: 1.0
-      inverse_loss_coef: 0.0
-      lr: 1.0e-4
+      inverse_loss_coef: 0.0    # NOT IMPLEMENTED: the ICM has no inverse head
+      lr: 1.0e-4                # NOT IMPLEMENTED: one pretext optimizer covers
+                                # encoder + ICM and uses encoder.lr
+    # NOT IMPLEMENTED: the camera keys are fixed to the openpi forward_inputs
+    # ("observation/image" for contrastive, "observation/wrist_image" for the
+    # visual-ICM fallback).
     cameras:
       contrastive: static
       curiosity: gripper        # only used when icm.space == visual
+    # NOT WIRED: offline warmup has no training script yet (plan B = skip it);
+    # SSRLModule.load_warmup_checkpoint() exists but nothing calls it.
     warmup:
       enable: false             # #10=B: no offline warmup by default (plan B)
       data_path: null
@@ -113,7 +126,8 @@ algorithm:
       batch_size: 64
       ckpt_path: checkpoints/ssrl_warmup_r3m18.pt
     logging:
-      log_reward_components: true
+      log_reward_components: true  # NOT IMPLEMENTED: ssrl/* metrics are always
+                                   # logged when algorithm.ssrl.enable is true
 
 env:
   group_name: "EnvGroup"
