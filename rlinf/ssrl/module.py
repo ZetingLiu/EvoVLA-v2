@@ -37,10 +37,14 @@ from rlinf.ssrl.encoder import R3MVisualEncoder
 from rlinf.ssrl.icm import ICM
 from rlinf.ssrl.intrinsic import (
     RunningMeanStd,
+    apply_deadband,
     boundary_mask_from_dones,
     clip_intrinsic,
     fill_r_con_into_chunk_rewards,
+    linear_reward_scale,
+    mix_intrinsic,
     normalize_masked,
+    smooth_similarity_ema,
 )
 
 # Plain stdlib logger: ``rlinf.ssrl`` must stay importable without the
@@ -64,6 +68,14 @@ class SSRLModule(nn.Module):
         self.device = device
         self.num_chunks = int(cfg.get("num_action_chunks", 5))
         self.rho = float(cfg.get("rho", 0.6))
+        rho_con = cfg.get("rho_con", None)
+        rho_cur = cfg.get("rho_cur", None)
+        self.rho_con = self.rho if rho_con is None else float(rho_con)
+        self.rho_cur = self.rho if rho_cur is None else float(rho_cur)
+        schedule_cfg = cfg.get("reward_schedule", {})
+        self.r_con_schedule = schedule_cfg.get("r_con", {})
+        self.r_cur_schedule = schedule_cfg.get("r_cur", {})
+        self._reward_iter = 0
         self.use_contrastive = bool(cfg.get("use_contrastive", True))
         self.use_curiosity = bool(cfg.get("use_curiosity", True))
         self.normalize_intrinsic = bool(cfg.get("normalize_intrinsic", True))
@@ -83,10 +95,21 @@ class SSRLModule(nn.Module):
                     f"'scale_only', got {mode!r}"
                 )
         self.clip_value = float(cfg.get("clip_intrinsic", 1.0))
+        self.s_ema_beta = float(cfg.get("s_ema_beta", 0.0))
+        self.r_con_deadband = float(cfg.get("r_con_deadband", 0.0))
         self.freeze_backbone = bool(cfg.get("freeze_backbone", True))
         # Read before the first r_con write (review P1-10: the attribute was
         # previously uninitialized until _compute_r_con ran).
         self._last_r_con_raw: float = 0.0
+        self._last_r_con_stats = {
+            "raw_delta_mean": 0.0,
+            "raw_delta_std": 0.0,
+            "smoothed_delta_mean": 0.0,
+            "smoothed_delta_std": 0.0,
+            "positive_rate": 0.0,
+            "negative_rate": 0.0,
+            "deadband_rate": 0.0,
+        }
         # Warn (once per branch) instead of silently degrading when a branch
         # is enabled but its inputs are missing (plan §8.3 / review P1-6):
         # a silent None reads as "SSRL ran fine" in the metrics.
@@ -253,7 +276,20 @@ class SSRLModule(nn.Module):
         # Intrinsic branches are computed on the SSRL device; the result is
         # moved back to the batch device so the caller can add it to the
         # (typically CPU) rollout rewards.
-        intrinsic = torch.zeros(T, B, C, device=self.device, dtype=torch.float32)
+        zeros = torch.zeros(T, B, C, device=self.device, dtype=torch.float32)
+        con_scale = linear_reward_scale(self._reward_iter, self.r_con_schedule)
+        cur_scale = linear_reward_scale(self._reward_iter, self.r_cur_schedule)
+        rho_con_effective = self.rho_con * con_scale
+        rho_cur_effective = self.rho_cur * cur_scale
+        intrinsic = mix_intrinsic(
+            zeros,
+            r_con,
+            r_cur,
+            rho=self.rho,
+            rho_con=rho_con_effective,
+            rho_cur=rho_cur_effective,
+        )
+        self._reward_iter += 1
         # FIXED metric key set (review P0-4): the keys must not depend on
         # which branches produced data — cross-rank all_reduce_dict packs
         # sorted(keys) into a tensor and rank-dependent key sets would
@@ -262,7 +298,6 @@ class SSRLModule(nn.Module):
         metrics["ssrl/r_con_active"] = float(r_con is not None)
         metrics["ssrl/r_cur_active"] = float(r_cur is not None)
         if r_con is not None:
-            intrinsic = intrinsic + r_con
             metrics["ssrl/r_con_norm"] = r_con.mean().item()
             metrics["ssrl/r_con_raw_mean"] = self._last_r_con_raw
             metrics["ssrl/r_con_sign_flip_rate"] = self._sign_flip_rate(r_con)
@@ -271,16 +306,29 @@ class SSRLModule(nn.Module):
             metrics["ssrl/r_con_raw_mean"] = 0.0
             metrics["ssrl/r_con_sign_flip_rate"] = 0.0
         if r_cur is not None:
-            intrinsic = intrinsic + r_cur
             metrics["ssrl/r_cur_norm"] = r_cur.mean().item()
         else:
             metrics["ssrl/r_cur_norm"] = 0.0
+        for name, value in self._last_r_con_stats.items():
+            metrics[f"ssrl/r_con_{name}"] = value if r_con is not None else 0.0
+        metrics["ssrl/rho_con_effective"] = rho_con_effective
+        metrics["ssrl/rho_cur_effective"] = rho_cur_effective
+        metrics["ssrl/r_con_weighted_abs_mean"] = (
+            (rho_con_effective * r_con).abs().mean().item()
+            if r_con is not None
+            else 0.0
+        )
+        metrics["ssrl/r_cur_weighted_abs_mean"] = (
+            (rho_cur_effective * r_cur).abs().mean().item()
+            if r_cur is not None
+            else 0.0
+        )
         metrics["ssrl/intrinsic_sum"] = intrinsic.sum().item()
-        # §8.4 hacking watch: mean |rho * intrinsic| relative to mean |r_ext|
+        # §8.4 hacking watch: mean effective intrinsic relative to mean |r_ext|
         # (mean-based ratio — the per-entry ratio is undefined on a sparse
         # r_ext that is mostly zero).
         metrics["ssrl/r_ext"] = rewards.mean().item()
-        intrinsic_abs = (self.rho * intrinsic.abs().mean()).item()
+        intrinsic_abs = intrinsic.abs().mean().item()
         r_ext_abs = rewards.abs().mean().item()
         metrics["ssrl/intrinsic_abs_mean"] = intrinsic_abs
         metrics["ssrl/r_ext_abs_mean"] = r_ext_abs
@@ -351,21 +399,75 @@ class SSRLModule(nn.Module):
             if T > 1:
                 invalid[1:] |= pad[:-1]
 
+        raw_delta = torch.zeros(T, B, device=self.device)
+        raw_delta[1:T_im] = s[1:] - s[:-1]
+        raw_delta = raw_delta.masked_fill(invalid, 0.0)
+
+        smoothed_s = smooth_similarity_ema(
+            s,
+            invalid[:T_im],
+            self.s_ema_beta,
+        )
         delta_s = torch.zeros(T, B, device=self.device)
-        delta_s[1:T_im] = s[1:] - s[:-1]
+        delta_s[1:T_im] = smoothed_s[1:] - smoothed_s[:-1]
         delta_s = delta_s.masked_fill(invalid, 0.0)
 
         self._last_r_con_raw = float(delta_s.abs().mean().item())
+        valid = ~invalid
+        valid_raw = raw_delta[valid]
+        valid_smoothed = delta_s[valid]
+        self._last_r_con_stats.update(
+            {
+                "raw_delta_mean": (
+                    valid_raw.mean().item() if valid_raw.numel() else 0.0
+                ),
+                "raw_delta_std": (
+                    valid_raw.std(unbiased=False).item()
+                    if valid_raw.numel()
+                    else 0.0
+                ),
+                "smoothed_delta_mean": (
+                    valid_smoothed.mean().item() if valid_smoothed.numel() else 0.0
+                ),
+                "smoothed_delta_std": (
+                    valid_smoothed.std(unbiased=False).item()
+                    if valid_smoothed.numel()
+                    else 0.0
+                ),
+            }
+        )
         if self.normalize_intrinsic:
             delta_s = normalize_masked(
                 delta_s,
                 invalid,
                 self.rms_r_con,
                 mode=self.normalize_r_con,
-                clip=self.clip_value,
+                clip=0.0,
             )
-        elif self.clip_value > 0:
-            delta_s = clip_intrinsic(delta_s, self.clip_value)
+        deadbanded = apply_deadband(delta_s, invalid, self.r_con_deadband)
+        valid_before_deadband = delta_s[valid]
+        deadband_count = (
+            (valid_before_deadband.abs() < self.r_con_deadband).sum().item()
+            if valid_before_deadband.numel()
+            else 0
+        )
+        if self.clip_value > 0:
+            delta_s = clip_intrinsic(deadbanded, self.clip_value)
+        else:
+            delta_s = deadbanded
+        valid_final = delta_s[valid]
+        valid_count = valid_final.numel()
+        self._last_r_con_stats.update(
+            {
+                "positive_rate": (
+                    (valid_final > 0).float().mean().item() if valid_count else 0.0
+                ),
+                "negative_rate": (
+                    (valid_final < 0).float().mean().item() if valid_count else 0.0
+                ),
+                "deadband_rate": deadband_count / valid_count if valid_count else 0.0,
+            }
+        )
         return fill_r_con_into_chunk_rewards(delta_s, self.num_chunks)
 
     # forward_inputs keys concatenated into the pose state (plan §3.3 B).
@@ -711,6 +813,7 @@ class SSRLModule(nn.Module):
             "rms_r_con": self.rms_r_con.state_dict(),
             "rms_r_cur": self.rms_r_cur.state_dict(),
             "rms_state": self.rms_state.state_dict(),
+            "reward_iter": self._reward_iter,
         }
 
     def load_ssrl_state(self, state: dict[str, Any]) -> None:
@@ -724,6 +827,8 @@ class SSRLModule(nn.Module):
         # Absent in checkpoints written before the pose-space ICM change.
         if "rms_state" in state:
             self.rms_state.load_state_dict(state["rms_state"])
+        # Absent in checkpoints written before reward scheduling.
+        self._reward_iter = int(state.get("reward_iter", 0))
 
     def load_warmup_checkpoint(self, path: str) -> None:
         """Load an offline warmup checkpoint (plan B: normally unused)."""

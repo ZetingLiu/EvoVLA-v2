@@ -1368,16 +1368,13 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         # per-chunk-frame deltas are conserved.  No-op when disabled.
         ssrl_metrics = {}
         if self.ssrl is not None:
-            from rlinf.ssrl.intrinsic import mix_intrinsic
-
             intrinsic, ssrl_metrics = self.ssrl.compute_intrinsic_rewards(
                 self.rollout_batch
             )
-            # Single mixing path shared with the unit tests (review P2-11):
-            # r_ext + rho * intrinsic, with the branches already summed by
-            # ``compute_intrinsic_rewards``.
-            self.rollout_batch["rewards"] = mix_intrinsic(
-                self.rollout_batch["rewards"], intrinsic, None, self.ssrl.rho
+            # ``compute_intrinsic_rewards`` has already applied independent
+            # branch weights and schedules. Add it exactly once before GAE.
+            self.rollout_batch["rewards"] = (
+                self.rollout_batch["rewards"] + intrinsic
             )
 
         if self.cfg.algorithm.adv_type == "opd":

@@ -69,7 +69,11 @@ algorithm:
   # enable=false ≡ original RLinf behavior (all hooks are no-ops).
   ssrl:
     enable: false
-    rho: 0.6
+    rho: 0.6                  # backward-compatible fallback for old configs
+    # Conservative starting weights; calibrate with a short reward smoke and
+    # ablate before a full run. Each branch has its own schedule below.
+    rho_con: 0.1
+    rho_cur: 0.05
     use_contrastive: true
     use_curiosity: true
     freeze_backbone: true       # #10=B: freeze R3M, train projection head only
@@ -77,14 +81,29 @@ algorithm:
                                 # default): only the ICM keeps training, so r_con
                                 # measures progress in a fixed metric space
     normalize_intrinsic: true
-    normalize_r_con: mean_std   # optional scale_only (potential-shaping ablation)
+    normalize_r_con: scale_only # preserve the sign of the potential difference
     normalize_r_cur: scale_only # r_cur is forward-MSE (nonnegative): mean_std would
                                 # turn average-novelty steps into a per-step penalty
     clip_intrinsic: 1.0
     # Peak-memory knob: frames per R3M forward when encoding the [T*B] stack.
     encode_micro_batch: 256
-    s_ema_beta: 0.0             # NOT IMPLEMENTED (§8.3 #2 idea, kept as a
-                                # placeholder): s_t is differenced directly
+    # Smooth the potential before differencing. The EMA resets at instruction,
+    # episode and padding boundaries, so it never leaks across trajectories.
+    s_ema_beta: 0.9
+    # Applied after normalization; suppresses jitter without clipping true
+    # negative progress to zero.
+    r_con_deadband: 0.05
+    reward_schedule:
+      r_con:
+        warmup_iters: 20
+        decay_start_iters: -1   # both negative disables decay
+        decay_end_iters: -1
+        final_scale: 1.0
+      r_cur:
+        warmup_iters: 20
+        decay_start_iters: 100
+        decay_end_iters: 600
+        final_scale: 0.1
     num_action_chunks: ${actor.model.num_action_chunks}
     encoder:
       backbone: r3m_resnet18

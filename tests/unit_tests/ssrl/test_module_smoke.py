@@ -219,12 +219,18 @@ def test_ssrl_state_roundtrip(ssrl_module, monkeypatch):
     fresh.load_ssrl_state(state)
     assert fresh.rms_r_con.count == ssrl_module.rms_r_con.count
     assert fresh.rms_state.count == ssrl_module.rms_state.count
+    assert fresh._reward_iter == ssrl_module._reward_iter
 
-    # checkpoints written before the pose-space change lack rms_state
-    legacy = {k: v for k, v in state.items() if k != "rms_state"}
+    # Older checkpoints lack pose RMS and reward-schedule iteration.
+    legacy = {
+        key: value
+        for key, value in state.items()
+        if key not in {"rms_state", "reward_iter"}
+    }
     fresh2 = _make_module(monkeypatch, icm_space="pose")
     fresh2.load_ssrl_state(legacy)
     assert fresh2.rms_state.count == 0
+    assert fresh2._reward_iter == 0
 
 
 def test_nn_module_state_dict_is_not_shadowed(ssrl_module):
@@ -303,6 +309,17 @@ _FIXED_COMPUTE_KEYS = {
     "ssrl/r_con_norm",
     "ssrl/r_con_raw_mean",
     "ssrl/r_con_sign_flip_rate",
+    "ssrl/r_con_raw_delta_mean",
+    "ssrl/r_con_raw_delta_std",
+    "ssrl/r_con_smoothed_delta_mean",
+    "ssrl/r_con_smoothed_delta_std",
+    "ssrl/r_con_positive_rate",
+    "ssrl/r_con_negative_rate",
+    "ssrl/r_con_deadband_rate",
+    "ssrl/rho_con_effective",
+    "ssrl/rho_cur_effective",
+    "ssrl/r_con_weighted_abs_mean",
+    "ssrl/r_cur_weighted_abs_mean",
     "ssrl/r_cur_active",
     "ssrl/r_cur_norm",
     "ssrl/intrinsic_sum",

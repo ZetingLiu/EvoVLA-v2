@@ -1131,6 +1131,51 @@ def _validate_ssrl_cfg(cfg, model_cfg, only_eval: bool) -> None:
         raise ValueError(
             f"algorithm.ssrl.rho must be >= 0, got {float(ssrl.get('rho'))}"
         )
+    for key in ("rho_con", "rho_cur"):
+        value = ssrl.get(key, None)
+        if value is not None and float(value) < 0:
+            raise ValueError(f"algorithm.ssrl.{key} must be >= 0, got {value}")
+
+    beta = float(ssrl.get("s_ema_beta", 0.0))
+    if not 0.0 <= beta < 1.0:
+        raise ValueError(
+            f"algorithm.ssrl.s_ema_beta must satisfy 0 <= beta < 1, got {beta}"
+        )
+    deadband = float(ssrl.get("r_con_deadband", 0.0))
+    if deadband < 0:
+        raise ValueError(
+            f"algorithm.ssrl.r_con_deadband must be >= 0, got {deadband}"
+        )
+
+    reward_schedule = ssrl.get("reward_schedule", {})
+    for branch in ("r_con", "r_cur"):
+        schedule = reward_schedule.get(branch, {})
+        warmup = int(schedule.get("warmup_iters", 0))
+        decay_start = int(schedule.get("decay_start_iters", -1))
+        decay_end = int(schedule.get("decay_end_iters", -1))
+        final_scale = float(schedule.get("final_scale", 1.0))
+        prefix = f"algorithm.ssrl.reward_schedule.{branch}"
+        if warmup < 0:
+            raise ValueError(f"{prefix}.warmup_iters must be >= 0, got {warmup}")
+        if (decay_start < 0) != (decay_end < 0):
+            raise ValueError(
+                f"{prefix} decay boundaries must both be negative (disabled) "
+                "or both be nonnegative"
+            )
+        if decay_start >= 0 and decay_end <= decay_start:
+            raise ValueError(
+                f"{prefix}.decay_end_iters must be greater than "
+                f"decay_start_iters, got {decay_start}, {decay_end}"
+            )
+        if decay_start >= 0 and decay_start < warmup:
+            raise ValueError(
+                f"{prefix}.decay_start_iters must be >= warmup_iters, got "
+                f"{decay_start} < {warmup}"
+            )
+        if not 0.0 <= final_scale <= 1.0:
+            raise ValueError(
+                f"{prefix}.final_scale must be in [0, 1], got {final_scale}"
+            )
 
 
 def validate_offline_cfg(cfg: DictConfig) -> DictConfig:

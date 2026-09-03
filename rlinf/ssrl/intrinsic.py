@@ -20,9 +20,108 @@ alignment contract can be unit-tested without CALVIN or a GPU — see
 
 from __future__ import annotations
 
-from typing import Literal
+from collections.abc import Mapping
+from typing import Any, Literal
 
 import torch
+
+
+def smooth_similarity_ema(
+    similarity: torch.Tensor,
+    reset_mask: torch.Tensor,
+    beta: float,
+) -> torch.Tensor:
+    """Smooth per-trajectory similarity without crossing invalid boundaries.
+
+    Args:
+        similarity: Raw visual-language similarity with shape ``[T, B]``.
+        reset_mask: Boolean ``[T, B]`` mask. A true entry starts a new EMA
+            segment at the corresponding raw similarity.
+        beta: EMA decay in ``[0, 1)``. Zero preserves the input exactly.
+
+    Returns:
+        Boundary-aware EMA-smoothed similarity with shape ``[T, B]``.
+    """
+    if similarity.dim() != 2:
+        raise ValueError(
+            f"similarity must be [T, B], got {tuple(similarity.shape)}"
+        )
+    if reset_mask.shape != similarity.shape or reset_mask.dtype != torch.bool:
+        raise ValueError(
+            "reset_mask must be bool with the same shape as similarity, got "
+            f"{reset_mask.dtype} {tuple(reset_mask.shape)}"
+        )
+    if not 0.0 <= beta < 1.0:
+        raise ValueError(f"beta must satisfy 0 <= beta < 1, got {beta}")
+    if similarity.shape[0] == 0 or beta == 0.0:
+        return similarity.clone()
+
+    smoothed = [similarity[0]]
+    for t in range(1, similarity.shape[0]):
+        candidate = beta * smoothed[-1] + (1.0 - beta) * similarity[t]
+        smoothed.append(torch.where(reset_mask[t], similarity[t], candidate))
+    return torch.stack(smoothed, dim=0)
+
+
+def apply_deadband(
+    x: torch.Tensor,
+    invalid: torch.Tensor,
+    threshold: float,
+) -> torch.Tensor:
+    """Zero invalid entries and valid fluctuations below ``threshold``.
+
+    The deadband is intended for normalized rewards, making its threshold
+    independent of the raw cosine-similarity scale.
+    """
+    if invalid.shape != x.shape or invalid.dtype != torch.bool:
+        raise ValueError(
+            f"invalid must be bool with shape {tuple(x.shape)}, got "
+            f"{invalid.dtype} {tuple(invalid.shape)}"
+        )
+    if threshold < 0:
+        raise ValueError(f"threshold must be >= 0, got {threshold}")
+    suppressed = invalid | (x.abs() < threshold)
+    return x.masked_fill(suppressed, 0.0)
+
+
+def linear_reward_scale(
+    iteration: int,
+    schedule: Mapping[str, Any] | None,
+) -> float:
+    """Return a warmup/linear-decay multiplier for one reward branch.
+
+    A missing or empty schedule is an exact no-op. Decay is disabled when
+    either decay boundary is negative.
+    """
+    if iteration < 0:
+        raise ValueError(f"iteration must be >= 0, got {iteration}")
+    if not schedule:
+        return 1.0
+
+    warmup_iters = int(schedule.get("warmup_iters", 0))
+    decay_start = int(schedule.get("decay_start_iters", -1))
+    decay_end = int(schedule.get("decay_end_iters", -1))
+    final_scale = float(schedule.get("final_scale", 1.0))
+    if warmup_iters < 0:
+        raise ValueError(f"warmup_iters must be >= 0, got {warmup_iters}")
+    decay_disabled = decay_start < 0 and decay_end < 0
+    if (decay_start < 0) != (decay_end < 0):
+        raise ValueError("decay_start_iters and decay_end_iters must both be set")
+    if not decay_disabled and decay_end <= decay_start:
+        raise ValueError("decay_end_iters must be greater than decay_start_iters")
+    if not decay_disabled and decay_start < warmup_iters:
+        raise ValueError("decay_start_iters must be >= warmup_iters")
+    if not 0.0 <= final_scale <= 1.0:
+        raise ValueError(f"final_scale must be in [0, 1], got {final_scale}")
+
+    if warmup_iters > 0 and iteration < warmup_iters:
+        return iteration / warmup_iters
+    if decay_disabled or iteration <= decay_start:
+        return 1.0
+    if iteration >= decay_end:
+        return final_scale
+    progress = (iteration - decay_start) / (decay_end - decay_start)
+    return 1.0 + progress * (final_scale - 1.0)
 
 
 def fill_r_con_into_chunk_rewards(
@@ -217,15 +316,22 @@ def mix_intrinsic(
     r_con: torch.Tensor | None,
     r_cur: torch.Tensor | None,
     rho: float,
+    *,
+    rho_con: float | None = None,
+    rho_cur: float | None = None,
 ) -> torch.Tensor:
-    """Compose the total reward: ``r_ext + rho * (r_con + r_cur)``.
+    """Compose external reward with independently weighted SSRL branches.
 
     Disabled branches contribute zero; all tensors are ``[T, B, C]`` and
-    must already be normalized/clipped where configured.
+    must already be normalized/clipped where configured. When branch weights
+    are omitted, both fall back to ``rho`` for backward compatibility:
+    ``r_ext + rho * (r_con + r_cur)``.
     """
-    intrinsic = torch.zeros_like(r_ext)
+    con_weight = rho if rho_con is None else rho_con
+    cur_weight = rho if rho_cur is None else rho_cur
+    total = r_ext.clone()
     if r_con is not None:
-        intrinsic = intrinsic + r_con
+        total = total + con_weight * r_con
     if r_cur is not None:
-        intrinsic = intrinsic + r_cur
-    return r_ext + rho * intrinsic
+        total = total + cur_weight * r_cur
+    return total

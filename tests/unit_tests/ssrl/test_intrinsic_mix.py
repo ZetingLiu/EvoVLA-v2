@@ -19,6 +19,7 @@ import torch
 from rlinf.ssrl.intrinsic import (
     RunningMeanStd,
     clip_intrinsic,
+    linear_reward_scale,
     mix_intrinsic,
 )
 
@@ -96,6 +97,43 @@ def test_mix_disabled_branches():
     r_con = torch.full((4, 2, 5), 0.1)
     expected = r_ext + 0.6 * r_con
     torch.testing.assert_close(mix_intrinsic(r_ext, r_con, None, 0.6), expected)
+
+
+def test_mix_intrinsic_independent_branch_weights():
+    r_ext = torch.ones(2, 1, 3)
+    r_con = torch.full_like(r_ext, 0.5)
+    r_cur = torch.full_like(r_ext, 0.25)
+    mixed = mix_intrinsic(
+        r_ext,
+        r_con,
+        r_cur,
+        rho=0.6,
+        rho_con=0.3,
+        rho_cur=0.1,
+    )
+    expected = r_ext + 0.3 * r_con + 0.1 * r_cur
+    torch.testing.assert_close(mixed, expected)
+
+
+def test_linear_reward_scale_warmup_and_decay():
+    schedule = {
+        "warmup_iters": 10,
+        "decay_start_iters": 20,
+        "decay_end_iters": 40,
+        "final_scale": 0.5,
+    }
+    assert linear_reward_scale(0, schedule) == 0.0
+    assert linear_reward_scale(5, schedule) == 0.5
+    assert linear_reward_scale(10, schedule) == 1.0
+    assert linear_reward_scale(20, schedule) == 1.0
+    assert linear_reward_scale(30, schedule) == 0.75
+    assert linear_reward_scale(40, schedule) == 0.5
+    assert linear_reward_scale(100, schedule) == 0.5
+
+
+def test_linear_reward_scale_defaults_to_noop():
+    assert linear_reward_scale(0, None) == 1.0
+    assert linear_reward_scale(123, {}) == 1.0
 
 
 def test_info_nce_loss_shapes_match_pretext():

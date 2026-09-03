@@ -103,6 +103,44 @@ def test_negative_rho_raises():
         _validate_ssrl_cfg(cfg, model_cfg, only_eval=False)
 
 
+@pytest.mark.parametrize("key", ["rho_con", "rho_cur"])
+def test_negative_branch_weight_raises(key):
+    cfg, model_cfg = _cfg(algorithm={"ssrl": {key: -0.1}})
+    with pytest.raises(ValueError, match=key):
+        _validate_ssrl_cfg(cfg, model_cfg, only_eval=False)
+
+
+@pytest.mark.parametrize("beta", [-0.1, 1.0])
+def test_invalid_ema_beta_raises(beta):
+    cfg, model_cfg = _cfg(algorithm={"ssrl": {"s_ema_beta": beta}})
+    with pytest.raises(ValueError, match="s_ema_beta"):
+        _validate_ssrl_cfg(cfg, model_cfg, only_eval=False)
+
+
+def test_negative_deadband_raises():
+    cfg, model_cfg = _cfg(algorithm={"ssrl": {"r_con_deadband": -0.1}})
+    with pytest.raises(ValueError, match="r_con_deadband"):
+        _validate_ssrl_cfg(cfg, model_cfg, only_eval=False)
+
+
+@pytest.mark.parametrize(
+    "schedule",
+    [
+        {"warmup_iters": -1},
+        {"decay_start_iters": 10, "decay_end_iters": -1},
+        {"decay_start_iters": 10, "decay_end_iters": 10},
+        {"warmup_iters": 20, "decay_start_iters": 10, "decay_end_iters": 30},
+        {"final_scale": 1.1},
+    ],
+)
+def test_invalid_reward_schedule_raises(schedule):
+    cfg, model_cfg = _cfg(
+        algorithm={"ssrl": {"reward_schedule": {"r_con": schedule}}}
+    )
+    with pytest.raises(ValueError, match="reward_schedule.r_con"):
+        _validate_ssrl_cfg(cfg, model_cfg, only_eval=False)
+
+
 def test_shipped_yaml_passes_when_ssrl_is_switched_on(monkeypatch):
     """The shipped config ships with ``enable: false``; flipping both enables
     (the documented way to turn SSRL on) must satisfy the validator."""

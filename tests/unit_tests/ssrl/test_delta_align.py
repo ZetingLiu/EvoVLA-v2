@@ -28,7 +28,9 @@ import torch
 
 from rlinf.algorithms.utils import preprocess_embodied_advantages_inputs
 from rlinf.ssrl.intrinsic import (
+    apply_deadband,
     fill_r_con_into_chunk_rewards,
+    smooth_similarity_ema,
     zero_delta_s_at_dones,
 )
 
@@ -77,6 +79,31 @@ def test_fill_sum_conservation():
 def test_fill_rejects_wrong_rank():
     with pytest.raises(ValueError):
         fill_r_con_into_chunk_rewards(torch.zeros(2, 3, 4), 5)
+
+
+def test_similarity_ema_resets_at_boundaries():
+    """EMA must restart rather than carrying history across any boundary."""
+    similarity = torch.tensor([[0.0], [1.0], [10.0], [11.0], [12.0]])
+    reset = torch.tensor([[True], [False], [True], [False], [False]])
+    smoothed = smooth_similarity_ema(similarity, reset, beta=0.5)
+    expected = torch.tensor([[0.0], [0.5], [10.0], [10.5], [11.25]])
+    torch.testing.assert_close(smoothed, expected)
+
+
+def test_similarity_ema_preserves_negative_progress():
+    """Smoothing reduces jitter but must not erase a genuine regression."""
+    similarity = torch.tensor([[1.0], [0.8], [0.6]])
+    reset = torch.tensor([[True], [False], [False]])
+    smoothed = smooth_similarity_ema(similarity, reset, beta=0.5)
+    delta = smoothed[1:] - smoothed[:-1]
+    assert (delta < 0).all()
+
+
+def test_deadband_suppresses_only_small_valid_fluctuations():
+    reward = torch.tensor([[-0.2, -0.04, 0.03, 0.2]])
+    invalid = torch.tensor([[False, False, False, True]])
+    out = apply_deadband(reward, invalid, threshold=0.05)
+    torch.testing.assert_close(out, torch.tensor([[-0.2, 0.0, 0.0, 0.0]]))
 
 
 def test_chunk_level_preprocess_recovers_delta():
