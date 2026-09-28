@@ -25,9 +25,7 @@ from fastapi import FastAPI, Request, Response
 from omegaconf import DictConfig
 from transformers import AutoTokenizer
 
-from rlinf.data.io_struct import (
-    RolloutResult,
-)
+from rlinf.data.schema.reasoning_results import RolloutResult
 from rlinf.scheduler import Channel, Worker
 
 
@@ -368,11 +366,11 @@ class ServerRolloutWorker(Worker):
 
         self.log_info("ServerRolloutWorker initialized")
 
-    async def shutdown(self):
-        """Shutdown the server and cleanup resources."""
-        self.log_info("Shutting down ServerRolloutWorker")
+    async def stop(self):
+        """Stop the server and cleanup resources."""
+        self.log_info("Stopping ServerRolloutWorker")
 
         while not self._data_source.empty():
             self._data_source.get_nowait()
 
-        self.log_info("ServerRolloutWorker shutdown complete")
+        self.log_info("ServerRolloutWorker stopped")

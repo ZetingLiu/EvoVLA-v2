@@ -24,6 +24,8 @@ import torch.nn.functional as F
 from omegaconf import OmegaConf, open_dict
 from omegaconf.dictconfig import DictConfig
 
+# Register built-in physical robots before parsing cluster hardware configs.
+import rlinf.robotics.robots  # noqa: F401
 from rlinf.envs import SupportedEnvType
 from rlinf.scheduler.cluster import Cluster
 from rlinf.utils.placement import (
@@ -85,15 +87,21 @@ SupportedModel.QWEN3_VL = SupportedModel.register("qwen3_vl", force=True)
 SupportedModel.QWEN3_MOE = SupportedModel.register("qwen3_moe", force=True)
 SupportedModel.OPENVLA = SupportedModel.register("openvla", force=True)
 SupportedModel.OPENVLA_OFT = SupportedModel.register("openvla_oft", force=True)
+SupportedModel.MOLMOACT2 = SupportedModel.register("molmoact2", force=True)
 SupportedModel.OPENPI = SupportedModel.register("openpi", force=True)
-SupportedModel.OPENPI_PYTORCH = SupportedModel.register("openpi_pytorch", force=True)
+SupportedModel.PI0_FAST = SupportedModel.register("pi0_fast", force=True)
 SupportedModel.STARVLA = SupportedModel.register("starvla", force=True)
 SupportedModel.MLP_POLICY = SupportedModel.register("mlp_policy", force=True)
 SupportedModel.RLT_MLP_POLICY = SupportedModel.register("rlt_mlp_policy", force=True)
+SupportedModel.RLT_TD3_MLP_POLICY = SupportedModel.register(
+    "rlt_td3_mlp_policy", force=True
+)
 SupportedModel.GR00T = SupportedModel.register("gr00t", force=True)
 SupportedModel.DEXBOTIC_PI = SupportedModel.register("dexbotic_pi", force=True)
 SupportedModel.DEXBOTIC_DM0 = SupportedModel.register("dexbotic_dm0", force=True)
 SupportedModel.DREAMZERO = SupportedModel.register("dreamzero", force=True)
+SupportedModel.FASTWAM = SupportedModel.register("fastwam", force=True)
+SupportedModel.COSMOS3 = SupportedModel.register("cosmos3", force=True)
 SupportedModel.CNN_POLICY = SupportedModel.register("cnn_policy", force=True)
 SupportedModel.FLOW_POLICY = SupportedModel.register("flow_policy", force=True)
 SupportedModel.CMA_POLICY = SupportedModel.register("cma", force=True)
@@ -107,26 +115,38 @@ SupportedModel.RECAP_VALUE_MODEL = SupportedModel.register(
 SupportedModel.STEAM_VALUE_MODEL = SupportedModel.register(
     "steam_value_model", force=True
 )
+SupportedModel.SD3 = SupportedModel.register("sd3", force=True)
+SupportedModel.WAN22_TI2V_5B = SupportedModel.register("wan22_ti2v_5b", force=True)
 
 SupportedModel.QWEN2_5_VL_SFT = SupportedModel.register("qwen2.5_vl", force=True)
 SupportedModel.QWEN3_VL_SFT = SupportedModel.register("qwen3_vl", force=True)
 SupportedModel.QWEN3_VL_MOE_SFT = SupportedModel.register("qwen3_vl_moe", force=True)
 SupportedModel.GR00T_N1D6 = SupportedModel.register("gr00t_n1d6", force=True)
+SupportedModel.DEEPSEEK_V3 = SupportedModel.register("deepseek_v3", force=True)
+# GLM-4.7-Flash: MLA (DeepSeek-V3-style) + GLM MoE + MTP, via Megatron-Bridge
+# GLM47FlashBridge (megatron-bridge >=0.5.0). Needs mcore 0.18.
+SupportedModel.GLM4_MOE_LITE = SupportedModel.register("glm4_moe_lite", force=True)
 SupportedModel.GR00T_N1D7 = SupportedModel.register("gr00t_n1d7", force=True)
+SupportedModel.EVO1 = SupportedModel.register("evo1", force=True)
+
+DIFFUSION_MODELS = {SupportedModel.SD3, SupportedModel.WAN22_TI2V_5B}
 
 EMBODIED_MODEL = set(
     {
         SupportedModel.OPENVLA,
         SupportedModel.OPENVLA_OFT,
         SupportedModel.OPENPI,
-        SupportedModel.OPENPI_PYTORCH,
+        SupportedModel.PI0_FAST,
         SupportedModel.STARVLA,
         SupportedModel.MLP_POLICY,
         SupportedModel.RLT_MLP_POLICY,
+        SupportedModel.RLT_TD3_MLP_POLICY,
         SupportedModel.GR00T,
         SupportedModel.DEXBOTIC_PI,
         SupportedModel.DEXBOTIC_DM0,
         SupportedModel.DREAMZERO,
+        SupportedModel.FASTWAM,
+        SupportedModel.COSMOS3,
         SupportedModel.CNN_POLICY,
         SupportedModel.FLOW_POLICY,
         SupportedModel.CMA_POLICY,
@@ -138,6 +158,7 @@ EMBODIED_MODEL = set(
         SupportedModel.CFG_MODEL,
         SupportedModel.RECAP_VALUE_MODEL,
         SupportedModel.STEAM_VALUE_MODEL,
+        SupportedModel.EVO1,
     }
 )
 
@@ -262,7 +283,7 @@ def activation_to_func(
     return activation_func
 
 
-def validate_rollout_cfg(cfg, algorithm_cfg):
+def validate_rollout_cfg(cfg, algorithm_cfg, actor_cfg=None):
     SupportedModel(cfg.model.model_type)  # To validate model_type is supported
 
     def validate_sglang_cfg(cfg):
@@ -293,6 +314,15 @@ def validate_rollout_cfg(cfg, algorithm_cfg):
             "rollout.model.model_path must be specified for rollout."
         )
 
+        cfg.model.trust_remote_code = cfg.model.get(
+            "trust_remote_code",
+            OmegaConf.select(
+                actor_cfg if actor_cfg is not None else OmegaConf.create({}),
+                "tokenizer.trust_remote_code",
+                default=False,
+            ),
+        )
+
         cfg.disable_log_stats = cfg.get("disable_log_stats", False)
         cfg.detokenize = cfg.get("detokenize", False)
         cfg.rollout_backend = cfg.get("rollout_backend", "sglang")
@@ -306,6 +336,36 @@ def validate_rollout_cfg(cfg, algorithm_cfg):
         cfg.vllm = validate_vllm_cfg(cfg.vllm)
 
     return cfg
+
+
+def hf_rope_parameters(hf_config) -> dict:
+    """Read a HuggingFace config's rope settings across transformers 4 and 5.
+
+    transformers 5 replaced the flat ``rope_theta`` / ``rope_scaling`` pair with a
+    single ``rope_parameters`` dict, renamed its ``type`` key to ``rope_type``,
+    and fills it in even for models that use no scaling (``rope_type: "default"``)
+    where transformers 4 left ``rope_scaling`` as ``None``.
+
+    Args:
+        hf_config: A ``PretrainedConfig`` (or its ``text_config``).
+
+    Returns:
+        The rope settings, always keyed the transformers 5 way.
+    """
+    params = getattr(hf_config, "rope_parameters", None)
+    if isinstance(params, dict):
+        return dict(params)
+
+    params = {}
+    scaling = getattr(hf_config, "rope_scaling", None)
+    if isinstance(scaling, dict):
+        params.update(scaling)
+        if "type" in params and "rope_type" not in params:
+            params["rope_type"] = params["type"]
+    theta = getattr(hf_config, "rope_theta", None)
+    if theta is not None:
+        params["rope_theta"] = theta
+    return params
 
 
 def validate_model_cfg_by_hf_config(cfg, hf_model_path):
@@ -334,16 +394,16 @@ def validate_model_cfg_by_hf_config(cfg, hf_model_path):
         qk_layernorm = getattr(cfg.model, "qk_layernorm", False)
 
     with open_dict(cfg):
-        rs = getattr(hf_config, "rope_scaling", None)
-        if isinstance(rs, dict):
-            rtype = rs.get("type", "")
-            if rtype in {"linear", "dynamic", "ntk", "yarn"}:
-                f = rs.get("factor")
-                if f is not None:
-                    cfg.model.seq_len_interpolation_factor = float(f)
-            else:
-                # mrope
-                cfg.model.seq_len_interpolation_factor = None
+        rs = hf_rope_parameters(hf_config)
+        rtype = rs.get("rope_type", "")
+        if rtype in {"linear", "dynamic", "ntk", "yarn"}:
+            f = rs.get("factor")
+            if f is not None:
+                cfg.model.seq_len_interpolation_factor = float(f)
+        elif rtype and rtype != "default":
+            # mrope. "default" means no scaling at all, which transformers 4
+            # reported as rope_scaling=None and so left this untouched.
+            cfg.model.seq_len_interpolation_factor = None
         model_type = getattr(cfg.model, "model_type", None)
         if model_type == "qwen3_vl" or model_type == "qwen3_vl_moe":
             # qwen3_vl and qwen3_vl_moe config.json set the model config in text_config
@@ -351,7 +411,7 @@ def validate_model_cfg_by_hf_config(cfg, hf_model_path):
 
         cfg.model.padded_vocab_size = hf_config.vocab_size
         cfg.model.max_position_embeddings = hf_config.max_position_embeddings
-        cfg.model.rotary_base = hf_config.rope_theta
+        cfg.model.rotary_base = hf_rope_parameters(hf_config)["rope_theta"]
         cfg.model.share_embeddings_and_output_weights = getattr(
             hf_config, "tie_word_embeddings", False
         )
@@ -381,7 +441,52 @@ def validate_model_cfg_by_hf_config(cfg, hf_model_path):
         )
         cfg.model.moe_router_topk = getattr(hf_config, "num_experts_per_tok", 2)
 
+        # DeepSeek-V3 and glm4_moe_lite text backbone: MLA + MoE with shared expert.
+        if model_type in ("deepseek_v3", "glm4_moe_lite"):
+            cfg.model.num_moe_experts = getattr(
+                hf_config, "n_routed_experts", cfg.model.num_moe_experts
+            )
+            cfg.model.num_experts = cfg.model.num_moe_experts
+            cfg.model.multi_latent_attention = True
+            for _mla_field in (
+                "q_lora_rank",
+                "kv_lora_rank",
+                "qk_nope_head_dim",
+                "qk_rope_head_dim",
+                "v_head_dim",
+            ):
+                _mla_v = getattr(hf_config, _mla_field, None)
+                if _mla_v is not None:
+                    cfg.model[_mla_field] = _mla_v
+            _moe_inter = getattr(hf_config, "moe_intermediate_size", 0) or 0
+            _n_shared = getattr(hf_config, "n_shared_experts", 1) or 1
+            cfg.model.moe_shared_expert_intermediate_size = (
+                _moe_inter * _n_shared or None
+            )
+            cfg.model.first_k_dense_replace = getattr(
+                hf_config, "first_k_dense_replace", 0
+            )
+            cfg.model.moe_router_topk_scaling_factor = getattr(
+                hf_config, "routed_scaling_factor", None
+            )
+
     return cfg
+
+
+def validate_fp32_master_adamw_config(
+    *,
+    strategy: str,
+    sharding_strategy: str,
+    is_lora: bool,
+) -> None:
+    """Validate the FSDP configurations exercised by FP32 master AdamW."""
+    strategy = str(strategy).lower()
+    sharding_strategy = str(sharding_strategy).lower()
+    if strategy != "fsdp" or sharding_strategy != "no_shard" or not is_lora:
+        raise ValueError(
+            "use_fp32_master_params currently supports only FSDP1 LoRA training "
+            "with fsdp_config.strategy=fsdp and sharding_strategy=no_shard."
+        )
 
 
 def validate_fsdp_cfg(cfg: DictConfig) -> DictConfig:
@@ -434,6 +539,16 @@ def validate_fsdp_cfg(cfg: DictConfig) -> DictConfig:
         cfg.fsdp_config.sharding_strategy = cfg.fsdp_config.get(
             "sharding_strategy", "full_shard"
         )
+        model_type = OmegaConf.select(cfg, "model.model_type", default=None)
+        if model_type is not None and str(model_type) == SupportedModel.OPENPI.value:
+            sharding = (
+                str(cfg.fsdp_config.sharding_strategy).strip().lower().replace("-", "_")
+            )
+            assert sharding == "no_shard", (
+                "openpi only supports actor.fsdp_config.sharding_strategy="
+                f"'no_shard' (got {cfg.fsdp_config.sharding_strategy!r}). "
+                "Nested FSDP flattening (full_shard / shard_grad_op) is not supported."
+            )
 
         cfg.fsdp_config.forward_prefetch = cfg.fsdp_config.get(
             "forward_prefetch", False
@@ -445,6 +560,23 @@ def validate_fsdp_cfg(cfg: DictConfig) -> DictConfig:
             "backward_prefetch", None
         )
         cfg.fsdp_config.use_orig_params = cfg.fsdp_config.get("use_orig_params", False)
+        if (
+            model_type is not None
+            and str(model_type) == SupportedModel.OPENPI.value
+            and not cfg.fsdp_config.use_orig_params
+        ):
+            # Dual-expert Gemma packs frozen VLM (expert-0) and trainable
+            # action expert (expert-1) in the same Block. FSDP FlatParameter
+            # then mixes requires_grad and rejects wrap unless
+            # use_orig_params=True. The shared hybrid_engines/fsdp default is
+            # False, so inherited CI/example YAMLs would otherwise fail at
+            # FSDP wrap time.
+            logging.info(
+                "openpi requires actor.fsdp_config.use_orig_params=True "
+                "because dual-expert Gemma Block mixes frozen and trainable "
+                "parameters. Overriding use_orig_params=False to True."
+            )
+            cfg.fsdp_config.use_orig_params = True
         cfg.fsdp_config.use_liger_kernel = cfg.fsdp_config.get(
             "use_liger_kernel", False
         )
@@ -481,6 +613,35 @@ def validate_fsdp_cfg(cfg: DictConfig) -> DictConfig:
             "buffer_dtype", None
         )
         cfg.fsdp_config = validate_amp_cfg(cfg.fsdp_config)
+
+        if model_type is not None and str(model_type) == SupportedModel.OPENPI.value:
+            mp = cfg.fsdp_config.mixed_precision
+            all_none = (
+                mp.param_dtype is None
+                and mp.reduce_dtype is None
+                and mp.buffer_dtype is None
+            )
+            all_fp32 = (
+                mp.param_dtype == "fp32"
+                and mp.reduce_dtype == "fp32"
+                and mp.buffer_dtype == "fp32"
+            )
+            assert all_none or all_fp32, (
+                "openpi does not support FSDP mixed precision "
+                f"(got param_dtype={mp.param_dtype!r}, "
+                f"reduce_dtype={mp.reduce_dtype!r}, "
+                f"buffer_dtype={mp.buffer_dtype!r}). "
+                "Set mixed_precision param/reduce/buffer dtype to null "
+                "(OpenPI default) or fp32."
+            )
+
+        if cfg.get("optim", {}).get("use_fp32_master_params", False):
+            model_cfg = cfg.get("model", {}) or {}
+            validate_fp32_master_adamw_config(
+                strategy=cfg.fsdp_config.strategy,
+                sharding_strategy=cfg.fsdp_config.sharding_strategy,
+                is_lora=bool(model_cfg.get("is_lora", False)),
+            )
 
     return cfg
 
@@ -822,18 +983,79 @@ def validate_megatron_cfg(cfg: DictConfig) -> DictConfig:
     return cfg
 
 
+def validate_only_eval_rollout_model(model_cfg) -> None:
+    """Fail fast when ``runner.only_eval`` uses a stub ``rollout.model``.
+
+    Eval YAMLs must put a full policy spec under ``rollout.model``.
+    """
+    missing: list[str] = []
+    if OmegaConf.select(model_cfg, "model_type", default=None) in (None, ""):
+        missing.append("rollout.model.model_type")
+    if OmegaConf.select(model_cfg, "num_action_chunks", default=None) is None:
+        missing.append("rollout.model.num_action_chunks")
+
+    model_type = str(OmegaConf.select(model_cfg, "model_type", default="") or "")
+    if model_type == SupportedModel.OPENPI.value:
+        if not OmegaConf.select(model_cfg, "openpi.config_name", default=None):
+            missing.append("rollout.model.openpi.config_name")
+        if OmegaConf.select(model_cfg, "openpi.task", default=None) in (None, ""):
+            missing.append("rollout.model.openpi.task")
+        has_num_steps = (
+            OmegaConf.select(model_cfg, "num_steps", default=None) is not None
+            or OmegaConf.select(model_cfg, "openpi.num_steps", default=None) is not None
+        )
+        if not has_num_steps:
+            missing.append("rollout.model.num_steps")
+
+    if missing:
+        raise ValueError(
+            "runner.only_eval=True requires a complete rollout.model "
+            "(path/precision alone is not enough). Missing: " + ", ".join(missing)
+        )
+
+
+def validate_weight_sync_overlap_cfg(cfg):
+    """Reject overlapping weight sync with a syncer that applies in pieces.
+
+    Patch applies a synchronization in one step. Bucket yields between buckets,
+    so a rollout generating concurrently could sample a model with only part of
+    the new weights applied.
+    """
+    if not cfg.get("actor", {}).get("sync_weight_no_wait", False):
+        return
+    assert cfg.get("weight_syncer", {}).get("type", None) == "patch", (
+        "actor.sync_weight_no_wait=true requires weight_syncer.type=patch so a "
+        "rollout cannot observe a partially applied bucket sync."
+    )
+
+
 def validate_embodied_cfg(cfg):
     only_eval = (
         cfg.runner.get("only_eval", False)
         or cfg.runner.get("task_type") == "embodied_eval"
     )
+    if only_eval:
+        validate_only_eval_rollout_model(cfg.rollout.model)
     model_cfg = cfg.rollout.model if only_eval else cfg.actor.model
     algorithm_cfg = cfg.get("algorithm", {}) or {}
     model_type = SupportedModel(model_cfg.model_type)
-    assert model_type in EMBODIED_MODEL, (
-        f"Model type: '{model_cfg.model_type}' is not an embodied model. "
-        f"Supported embodied models: {sorted([x.value for x in EMBODIED_MODEL])}."
+    assert model_type in EMBODIED_MODEL or model_type in DIFFUSION_MODELS, (
+        f"Model type: '{model_cfg.model_type}' is not supported by the embodied runner. "
+        f"Supported embodied models: {sorted([x.value for x in EMBODIED_MODEL])}; "
+        f"supported diffusion models: {sorted([x.value for x in DIFFUSION_MODELS])}."
     )
+    if not only_eval and algorithm_cfg.get("recompute_logprobs", False):
+        # The actor-side recompute reshapes logprobs by ``action_dim`` to report the
+        # gap per action, which assumes the OpenVLA family's tokenized action layout.
+        # GR00T needs no recompute: it already rescores inside its training forward.
+        assert model_type in [SupportedModel.OPENVLA, SupportedModel.OPENVLA_OFT], (
+            f"algorithm.recompute_logprobs supports "
+            f"{[SupportedModel.OPENVLA.value, SupportedModel.OPENVLA_OFT.value]}, "
+            f"got '{model_cfg.model_type}'."
+        )
+        assert algorithm_cfg.get("adv_type", None) != "opd", (
+            "algorithm.recompute_logprobs is not supported with adv_type=opd."
+        )
     with open_dict(cfg):
         cfg.runner.val_check_interval = cfg.runner.get("val_check_interval", -1)
     enable_eval = cfg.runner.val_check_interval > 0 or only_eval
@@ -928,6 +1150,17 @@ def validate_embodied_cfg(cfg):
             f"Current value: {add_value_head}"
         )
 
+    # MolmoAct2 caches an action queue per batch index inside the LeRobot policy.
+    # Pipeline stages hand the same indices to different environments on
+    # alternating calls, so one env would execute another env's queued actions.
+    if model_type == SupportedModel.MOLMOACT2:
+        assert cfg.rollout.pipeline_stage_num == 1, (
+            "model_type 'molmoact2' requires rollout.pipeline_stage_num to be 1, "
+            f"got {cfg.rollout.pipeline_stage_num}: the policy keys its "
+            "per-environment action queues by batch index, which pipeline stages "
+            "reuse across environments."
+        )
+
     # process num-envs
     component_placement = HybridComponentPlacement(cfg, Cluster())
     stage_num = cfg.rollout.pipeline_stage_num
@@ -945,9 +1178,9 @@ def validate_embodied_cfg(cfg):
         )
         reward_model_cfg = cfg.reward.get("model", {})
         if reward_worker_type == "api":
-            assert reward_model_cfg.get("model_type") == "history_vlm", (
+            assert reward_model_cfg.get("model_type") == "buffered_vlm", (
                 "reward.worker_type='api' currently requires "
-                "reward.model.model_type='history_vlm'."
+                "reward.model.model_type='buffered_vlm'."
             )
             api_cfg = cfg.reward.get("api", {})
             api_base = str(api_cfg.get("api_base") or "").strip()
@@ -1086,51 +1319,38 @@ def validate_embodied_cfg(cfg):
                 assert cfg.env.train.base_config_name == "r1pro_behavior", (
                     f"Only r1pro_behavior is supported for omnigibson, got {cfg.env.train.base_config_name}"
                 )
+
     _validate_ssrl_cfg(cfg, model_cfg, only_eval)
+    validate_weight_sync_overlap_cfg(cfg)
     return cfg
 
 
 def _validate_ssrl_cfg(cfg, model_cfg, only_eval: bool) -> None:
-    """Fail loudly on SSRL misconfiguration (review P1-6).
-
-    A desynced double-enable or a non-chunk reward layout silently degrades
-    SSRL into a plain baseline — hours of ABC->D training wasted without a
-    single metric going missing.  These checks only run when
-    ``algorithm.ssrl.enable`` is true; absent/dead SSRL config keeps the
-    original behavior.
-    """
+    """Validate the optional EvoVLA-v2 SSRL configuration."""
     ssrl = cfg.algorithm.get("ssrl") if cfg.algorithm is not None else None
-    if ssrl is None or not bool(ssrl.get("enable", False)):
+    if ssrl is None or not bool(ssrl.get("enable", False)) or only_eval:
         return
-    if only_eval:
-        return  # eval does not compute intrinsic rewards
 
-    # Double enable: the actor reads algorithm.ssrl.enable, the rollout-side
-    # openpi hook reads actor.model.openpi.ssrl.enable (yaml interpolation).
     openpi_ssrl = model_cfg.get("openpi", {}).get("ssrl", {})
     if not bool(openpi_ssrl.get("enable", False)):
         raise ValueError(
-            "algorithm.ssrl.enable=true but actor.model.openpi.ssrl.enable is "
-            "false — the rollout side will not write lang_emb/scene_obs and "
-            "SSRL silently degrades to baseline. Keep both enables in sync."
+            "algorithm.ssrl.enable=true but actor.model.openpi.ssrl.enable is false"
         )
     reward_type = cfg.algorithm.get("reward_type", None)
     if reward_type != "chunk_level":
         raise ValueError(
-            "algorithm.ssrl requires algorithm.reward_type == 'chunk_level' "
-            f"(intrinsic is filled into [T,B,C] before the chunk-dim sum), got {reward_type!r}."
+            "algorithm.ssrl requires algorithm.reward_type == 'chunk_level', "
+            f"got {reward_type!r}."
         )
     if int(ssrl.get("num_action_chunks", -1)) != int(
         model_cfg.get("num_action_chunks", -2)
     ):
         raise ValueError(
             "algorithm.ssrl.num_action_chunks must equal "
-            "actor.model.num_action_chunks (chunk-fill shape contract)."
+            "actor.model.num_action_chunks"
         )
     if float(ssrl.get("rho", 0.0)) < 0:
-        raise ValueError(
-            f"algorithm.ssrl.rho must be >= 0, got {float(ssrl.get('rho'))}"
-        )
+        raise ValueError("algorithm.ssrl.rho must be >= 0")
     for key in ("rho_con", "rho_cur"):
         value = ssrl.get(key, None)
         if value is not None and float(value) < 0:
@@ -1138,14 +1358,10 @@ def _validate_ssrl_cfg(cfg, model_cfg, only_eval: bool) -> None:
 
     beta = float(ssrl.get("s_ema_beta", 0.0))
     if not 0.0 <= beta < 1.0:
-        raise ValueError(
-            f"algorithm.ssrl.s_ema_beta must satisfy 0 <= beta < 1, got {beta}"
-        )
+        raise ValueError("algorithm.ssrl.s_ema_beta must satisfy 0 <= beta < 1")
     deadband = float(ssrl.get("r_con_deadband", 0.0))
     if deadband < 0:
-        raise ValueError(
-            f"algorithm.ssrl.r_con_deadband must be >= 0, got {deadband}"
-        )
+        raise ValueError("algorithm.ssrl.r_con_deadband must be >= 0")
 
     reward_schedule = ssrl.get("reward_schedule", {})
     for branch in ("r_con", "r_cur"):
@@ -1156,26 +1372,15 @@ def _validate_ssrl_cfg(cfg, model_cfg, only_eval: bool) -> None:
         final_scale = float(schedule.get("final_scale", 1.0))
         prefix = f"algorithm.ssrl.reward_schedule.{branch}"
         if warmup < 0:
-            raise ValueError(f"{prefix}.warmup_iters must be >= 0, got {warmup}")
+            raise ValueError(f"{prefix}.warmup_iters must be >= 0")
         if (decay_start < 0) != (decay_end < 0):
-            raise ValueError(
-                f"{prefix} decay boundaries must both be negative (disabled) "
-                "or both be nonnegative"
-            )
+            raise ValueError(f"{prefix} decay boundaries must both be enabled or disabled")
         if decay_start >= 0 and decay_end <= decay_start:
-            raise ValueError(
-                f"{prefix}.decay_end_iters must be greater than "
-                f"decay_start_iters, got {decay_start}, {decay_end}"
-            )
+            raise ValueError(f"{prefix}.decay_end_iters must exceed decay_start_iters")
         if decay_start >= 0 and decay_start < warmup:
-            raise ValueError(
-                f"{prefix}.decay_start_iters must be >= warmup_iters, got "
-                f"{decay_start} < {warmup}"
-            )
+            raise ValueError(f"{prefix}.decay_start_iters must be >= warmup_iters")
         if not 0.0 <= final_scale <= 1.0:
-            raise ValueError(
-                f"{prefix}.final_scale must be in [0, 1], got {final_scale}"
-            )
+            raise ValueError(f"{prefix}.final_scale must be in [0, 1]")
 
 
 def validate_offline_cfg(cfg: DictConfig) -> DictConfig:
@@ -1308,6 +1513,13 @@ def validate_sft_cfg(cfg: DictConfig) -> DictConfig:
 
             cfg.actor.model = validate_dreamzero_sft_model_cfg(cfg.actor.model)
 
+        elif SupportedModel(model_type) == SupportedModel.COSMOS3:
+            from rlinf.models.embodiment.cosmos3.cosmos3_config import (
+                validate_cosmos3_sft_model_cfg,
+            )
+
+            cfg.actor.model = validate_cosmos3_sft_model_cfg(cfg.actor.model)
+
         _validate_steam_ensemble_cfg(cfg.actor)
 
     return cfg
@@ -1374,7 +1586,35 @@ def validate_reasoning_cfg(cfg: DictConfig) -> DictConfig:
             or cfg.algorithm.get("importance_sampling_fix", False)
         )
 
-        cfg.rollout = validate_rollout_cfg(cfg.rollout, cfg.algorithm)
+        cfg.rollout = validate_rollout_cfg(
+            cfg.rollout, cfg.algorithm, cfg.get("actor", None)
+        )
+    return cfg
+
+
+def validate_searchr1_cfg(cfg: DictConfig) -> DictConfig:
+    """Validate SearchR1 multi-agent training requirements before launch."""
+    reward_cfg = cfg.get("reward", None)
+    if reward_cfg is None or reward_cfg.get("reward_type", None) != "searchr1":
+        return cfg
+
+    if not cfg.agentloop.get("is_dynamic_rollout_batch", False):
+        raise ValueError("SearchR1 requires agentloop.is_dynamic_rollout_batch=True.")
+    if not cfg.actor.get("enable_dp_load_balance", False):
+        raise ValueError("SearchR1 requires actor.enable_dp_load_balance=True.")
+    if cfg.actor.training_backend == "fsdp" and cfg.algorithm.get(
+        "importance_sampling_fix", False
+    ):
+        raise ValueError(
+            "SearchR1 with the FSDP multi-agent actor does not support "
+            "algorithm.importance_sampling_fix=True."
+        )
+
+    component_placement = ModelParallelComponentPlacement(cfg, Cluster())
+    if not component_placement.is_collocated:
+        raise ValueError(
+            "SearchR1 multi-agent actors support only collocated component placement."
+        )
     return cfg
 
 
@@ -1383,7 +1623,9 @@ def validate_reasoning_eval_cfg(cfg: DictConfig) -> DictConfig:
         assert cfg.runner.seq_length > cfg.data.max_prompt_length, (
             f"runner.seq_length ({cfg.runner.seq_length}) must be greater than data.max_prompt_length ({cfg.data.max_prompt_length})"
         )
-        cfg.rollout = validate_rollout_cfg(cfg.rollout, cfg.algorithm)
+        cfg.rollout = validate_rollout_cfg(
+            cfg.rollout, cfg.algorithm, cfg.get("actor", None)
+        )
     return cfg
 
 
@@ -1439,8 +1681,36 @@ def validate_coding_online_rl_cfg(cfg: DictConfig) -> DictConfig:
             or cfg.algorithm.get("importance_sampling_fix", False)
         )
 
-        cfg.rollout = validate_rollout_cfg(cfg.rollout, cfg.algorithm)
+        cfg.rollout = validate_rollout_cfg(
+            cfg.rollout, cfg.algorithm, cfg.get("actor", None)
+        )
     return cfg
+
+
+def adv_requires_group_baseline(
+    adv_type: Optional[str], use_reinpp_baseline: bool = False
+) -> bool:
+    """Whether an advantage estimator draws its baseline from within-group
+    statistics and therefore requires ``algorithm.group_size > 1``.
+
+    GRPO and GRPO-dynamic always normalize each reward against its group, so a
+    group of one leaves nothing to compare against. ReinForce++ only subtracts a
+    per-group mean when its baseline mode is enabled (``use_reinpp_baseline``);
+    plain ReinForce++ normalizes over the whole batch and is exempt.
+
+    ``adv_type`` is lower-cased to match how :func:`get_adv_and_returns`
+    dispatches, so a differently-cased name cannot slip past the guard and still
+    reach the group-based estimator. Offline configs leave it unset, which
+    selects no estimator and therefore needs no group.
+    """
+    if not adv_type:
+        return False
+    adv_type = adv_type.lower()
+    if adv_type in ("grpo", "grpo_dynamic"):
+        return True
+    if adv_type == "reinpp":
+        return bool(use_reinpp_baseline)
+    return False
 
 
 def validate_cfg(cfg: DictConfig) -> DictConfig:
@@ -1508,8 +1778,15 @@ def validate_cfg(cfg: DictConfig) -> DictConfig:
         cfg = validate_offline_cfg(cfg)
 
     if cfg.runner.task_type != "sft" and not cfg.runner.get("only_eval", False):
-        if cfg.algorithm.adv_type in ("grpo", "grpo_dynamic", "reinpp_baseline"):
-            assert cfg.algorithm.group_size > 1
+        if adv_requires_group_baseline(
+            cfg.algorithm.adv_type,
+            cfg.algorithm.get("use_reinpp_baseline", False),
+        ):
+            assert cfg.algorithm.group_size > 1, (
+                f"algorithm.adv_type={cfg.algorithm.adv_type!r} uses a "
+                f"within-group baseline and requires algorithm.group_size > 1, "
+                f"got {cfg.algorithm.group_size}."
+            )
 
     assert cfg.actor.training_backend in SUPPORTED_TRAINING_BACKENDS, (
         f"Unsupported training_backend {cfg.actor.training_backend}. Supported training backends are {SUPPORTED_TRAINING_BACKENDS}."
@@ -1553,6 +1830,9 @@ def validate_cfg(cfg: DictConfig) -> DictConfig:
             )
         elif cfg.critic.use_critic_model and cfg.critic.training_backend == "fsdp":
             cfg.critic = validate_fsdp_cfg(cfg.critic)
+
+    if cfg.runner.task_type == "reasoning":
+        cfg = validate_searchr1_cfg(cfg)
 
     return cfg
 

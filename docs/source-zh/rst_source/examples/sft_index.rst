@@ -33,13 +33,46 @@ VLA / WAM 模型监督微调
      </div>
 
      <div style="flex: 1 1 30%; max-width: 300px; text-align: center;">
+       <a href="embodied/sft_fastwam.html" style="display: block;"><img src="https://yuantianyuan01.github.io/FastWAM/static/images/teaser_main.png"
+            style="width: 100%; height: 200px; object-fit: cover; border-radius: 8px; box-shadow: 0 2px 6px rgba(0,0,0,0.15);" /></a>
+       <p style="margin-top: 8px; font-size: 14px; line-height: 1.4;">
+         <a href="embodied/sft_fastwam.html" style="text-decoration: underline; color: blue;">
+           <b>FastWAM 评测与监督微调</b>
+         </a><br>
+         在 LIBERO 上评测 FastWAM 并进行全参数 FSDP 监督微调
+       </p>
+     </div>
+
+     <div style="flex: 1 1 30%; max-width: 300px; text-align: center;">
+       <a href="embodied/sft_cosmos3.html" style="display: block;"><img src="https://raw.githubusercontent.com/NVIDIA/cosmos/main/cookbooks/cosmos3/cosmos3-model-architecture.png"
+            style="width: 100%; height: 200px; object-fit: cover; border-radius: 8px; box-shadow: 0 2px 6px rgba(0,0,0,0.15);" /></a>
+       <p style="margin-top: 8px; font-size: 14px; line-height: 1.4;">
+         <a href="embodied/sft_cosmos3.html" style="text-decoration: underline; color: blue;">
+           <b>Cosmos3 监督微调</b>
+         </a><br>
+         基于 NVIDIA Cosmos3-Nano（OmniMoT）的 LIBERO 动作策略 SFT
+       </p>
+     </div>
+
+     <div style="flex: 1 1 30%; max-width: 300px; text-align: center;">
        <a href="embodied/sft_vlm.html" style="display: block;"><img src="https://raw.githubusercontent.com/RLinf/misc/main/pic/release_0.2/qwen2_5_sft_vlm.png"
             style="width: 100%; height: 200px; object-fit: cover; border-radius: 8px; box-shadow: 0 2px 6px rgba(0,0,0,0.15);" /></a>
        <p style="margin-top: 8px; font-size: 14px; line-height: 1.4;">
          <a href="embodied/sft_vlm.html" style="text-decoration: underline; color: blue;">
-           <b>VLM模型监督微调训练</b>
+           <b>Qwen-VL</b>
          </a><br>
          支持 Qwen 系列等 VLM 的全量监督微调与结果评估
+       </p>
+     </div>
+
+     <div style="flex: 1 1 30%; max-width: 300px; text-align: center;">
+       <a href="embodied/dagger.html" style="display: block;"><img src="https://raw.githubusercontent.com/RLinf/misc/main/pic/dagger.jpg"
+            style="width: 100%; height: 200px; object-fit: cover; border-radius: 8px; box-shadow: 0 2px 6px rgba(0,0,0,0.15);" /></a>
+       <p style="margin-top: 8px; font-size: 14px; line-height: 1.4;">
+         <a href="embodied/dagger.html" style="text-decoration: underline; color: blue;">
+           <b>具身策略的 DAgger 训练</b>
+         </a><br>
+         通过专家重标注与回放缓冲区训练推进在线模仿学习
        </p>
      </div>
 
@@ -50,6 +83,8 @@ VLA / WAM 模型监督微调
    :maxdepth: 2
 
    OpenPI <embodied/sft_openpi>
-   OpenPI_mixed_precision <embodied/sft_openpi_pytorch>
    DreamZero <embodied/sft_dreamzero>
-   VLM <embodied/sft_vlm>
+   FastWAM <embodied/sft_fastwam>
+   Cosmos3 <embodied/sft_cosmos3>
+   Qwen-VL <embodied/sft_vlm>
+   DAgger <embodied/dagger>

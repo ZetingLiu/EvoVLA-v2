@@ -26,8 +26,8 @@ from rlinf.data.datasets.dagger import (
     RollingLeRobotDataset,
     build_dataloader_from_dataset,
 )
-from rlinf.data.embodied_io_struct import Trajectory
-from rlinf.data.replay_buffer import TrajectoryReplayBuffer
+from rlinf.data.schema.embodied_types import Trajectory
+from rlinf.data.storage.replay import TrajectoryReplayBuffer
 from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.scheduler import Channel, Worker
 from rlinf.utils import drq
@@ -35,7 +35,7 @@ from rlinf.utils.distributed import all_reduce_dict
 from rlinf.utils.metric_utils import append_to_dict, compute_split_num
 from rlinf.utils.nested_dict_process import put_tensor_device, split_dict_to_chunk
 from rlinf.utils.utils import clear_memory
-from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
+from rlinf.workers.actor.embodied_fsdp_actor_worker import EmbodiedFSDPActor
 
 
 class EmbodiedDAGGERFSDPPolicy(EmbodiedFSDPActor):
@@ -311,7 +311,7 @@ class EmbodiedDAGGERFSDPPolicy(EmbodiedFSDPActor):
 
         Each rank pulls at most ``split_num`` messages per call so multi-actor
         recv stays balanced like the buffer trajectory path. ``get_nowait`` is
-        used because env ranks with no completed episodes send nothing.
+        used because a rank with nothing completed contributes an empty shard.
         """
         send_num = self._component_placement.get_world_size("env") * self.stage_num
         recv_num = self._component_placement.get_world_size("actor")
@@ -331,9 +331,10 @@ class EmbodiedDAGGERFSDPPolicy(EmbodiedFSDPActor):
     def recv_lerobot_rollout_trajectories(self, input_channel: Channel) -> None:
         """Receive episodes from EnvWorker and append them to the memory dataset.
 
-        EnvWorkers collect completed episodes via ``EmbodiedLerobotRolloutResult``
-        and send them here each interact round. Empty batches are not sent by env;
-        if the dataset is still below ``min_frames``, training is skipped later.
+        The trajectory collector sends one episode shard per expected Actor
+        receive each interact round. A shard may be empty when no episode
+        completes; if the dataset is still below ``min_frames``, training is
+        skipped later.
         """
         self._recv_lerobot_episodes_from_channel(input_channel)
         if self.dataset.is_ready():
@@ -407,7 +408,7 @@ class EmbodiedDAGGERFSDPPolicy(EmbodiedFSDPActor):
             self._pending_archive_path = None
             self._pending_archive_episodes = []
 
-        from rlinf.data.lerobot_writer import LeRobotDatasetWriter
+        from rlinf.data.storage.lerobot import LeRobotDatasetWriter
 
         writer = LeRobotDatasetWriter()
         first = pending_episodes[0][0]

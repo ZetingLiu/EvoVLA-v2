@@ -24,10 +24,10 @@ from torch.utils.data import Dataset, RandomSampler, SequentialSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 
-from rlinf.data.io_struct import RolloutRequest
+from rlinf.data.schema.reasoning_requests import build_rollout_requests_from_batch
 from rlinf.scheduler import Channel
 from rlinf.scheduler import WorkerGroupFuncResult as Handle
-from rlinf.utils.data_iter_utils import split_list
+from rlinf.utils.checkpoint import parse_global_step_from_checkpoint_path
 from rlinf.utils.distributed import ScopedTimer
 from rlinf.utils.metric_logger import MetricLogger
 from rlinf.utils.runner_utils import check_progress, local_mkdir_safe
@@ -160,7 +160,7 @@ class ReasoningRunner:
         """
         self.train_dataset, self.val_dataset = train_dataset, val_dataset
         if collate_fn is None:
-            from rlinf.data.datasets import collate_fn
+            from rlinf.data.datasets.reasoning import collate_fn
 
         # Use a sampler to facilitate checkpoint resumption.
         # If shuffling is enabled in the data configuration, create a random sampler.
@@ -265,7 +265,9 @@ class ReasoningRunner:
         # Resume from checkpoint
         logging.info(f"Load from checkpoint folder: {self.cfg.runner.resume_dir}")
         # set global step
-        self.global_steps = int(self.cfg.runner.resume_dir.split("global_step_")[-1])
+        self.global_steps = parse_global_step_from_checkpoint_path(
+            self.cfg.runner.resume_dir
+        )
         logging.info(f"Setting global step to {self.global_steps}")
 
         actor_checkpoint_path = os.path.join(self.cfg.runner.resume_dir, "actor")
@@ -299,23 +301,27 @@ class ReasoningRunner:
                 self.cfg.runner.resume_dir = None
             else:
                 checkpoint_steps = [
-                    int(d.split("global_step_")[-1])
+                    parse_global_step_from_checkpoint_path(d)
                     for d in os.listdir(checkpoints_dir)
                     if d.startswith("global_step_")
                     and os.path.isdir(os.path.join(checkpoints_dir, d))
                 ]
 
-            if checkpoint_steps:
-                max_step = max(checkpoint_steps)
-                self.cfg.runner.resume_dir = os.path.join(
-                    checkpoints_dir, f"global_step_{max_step}"
+            resume_dir = None
+            for step in sorted(checkpoint_steps, reverse=True):
+                candidate = os.path.join(checkpoints_dir, f"global_step_{step}")
+                if self._is_complete_checkpoint(candidate):
+                    resume_dir = candidate
+                    break
+                logging.warning(
+                    f"Skipping incomplete checkpoint {candidate} during auto resume."
                 )
-                logging.info(
-                    f"Auto resume from checkpoint: {self.cfg.runner.resume_dir}"
-                )
+
+            self.cfg.runner.resume_dir = resume_dir
+            if resume_dir is not None:
+                logging.info(f"Auto resume from checkpoint: {resume_dir}")
             else:
-                self.cfg.runner.resume_dir = None
-                logging.info("No checkpoints found, starting from scratch")
+                logging.info("No complete checkpoints found, starting from scratch")
         self.init_rollout_workers()
         self.init_actor_critic_workers()
 
@@ -356,6 +362,21 @@ class ReasoningRunner:
 
         return flops_metrics
 
+    def _is_complete_checkpoint(self, checkpoint_dir: str) -> bool:
+        """Return whether a ``global_step_<N>`` directory finished writing.
+
+        ``_save_checkpoint`` writes the actor, then the optional critic, and
+        publishes the dataloader state last with an atomic rename, so the
+        presence of ``data/data.pt`` marks the whole checkpoint as complete.
+        """
+        if not os.path.isdir(os.path.join(checkpoint_dir, "actor")):
+            return False
+        if self.critic is not None and not os.path.isdir(
+            os.path.join(checkpoint_dir, "critic")
+        ):
+            return False
+        return os.path.isfile(os.path.join(checkpoint_dir, "data", "data.pt"))
+
     def _save_checkpoint(self):
         base_output_dir = os.path.join(
             self.cfg.runner.output_dir,
@@ -376,8 +397,17 @@ class ReasoningRunner:
         data_save_path = os.path.join(base_output_dir, "data")
         local_mkdir_safe(data_save_path)
         dataloader_local_path = os.path.join(data_save_path, "data.pt")
+        dataloader_tmp_path = f"{dataloader_local_path}.tmp"
         dataloader_state_dict = self.train_dataloader.state_dict()
-        torch.save(dataloader_state_dict, dataloader_local_path)
+        # Publish atomically so an interrupted save cannot leave a truncated
+        # data.pt behind, which auto resume reads as a complete checkpoint.
+        try:
+            torch.save(dataloader_state_dict, dataloader_tmp_path)
+            os.replace(dataloader_tmp_path, dataloader_local_path)
+        except BaseException:
+            if os.path.exists(dataloader_tmp_path):
+                os.remove(dataloader_tmp_path)
+            raise
 
     def _set_max_steps(self):
         self.num_steps_per_epoch = len(self.train_dataloader)
@@ -391,28 +421,16 @@ class ReasoningRunner:
         return self.global_steps // self.num_steps_per_epoch
 
     def _put_batch(self, batch: dict[str, torch.Tensor], split_size=None):
-        prompt_ids = batch["prompt"].tolist()
-        lengths = batch["length"].tolist()
-        answers = batch["answer"]
-        image_data = batch["image_data"]
-        multi_modal_inputs = batch["multi_modal_inputs"]
-        prompt_ids = [ids[-pmp_len:] for ids, pmp_len in zip(prompt_ids, lengths)]
         if split_size is None:
             split_size = self.component_placement.rollout_dp_size
 
-        for input_ids, answers, image_data, multi_modal_inputs in zip(
-            split_list(prompt_ids, split_size, enforce_divisible_batch=False),
-            split_list(answers, split_size, enforce_divisible_batch=False),
-            split_list(image_data, split_size, enforce_divisible_batch=False),
-            split_list(multi_modal_inputs, split_size, enforce_divisible_batch=False),
-        ):
-            request = RolloutRequest(
-                n=self.cfg.algorithm.group_size,
-                input_ids=input_ids,
-                answers=answers,
-                image_data=image_data,
-                multi_modal_inputs=multi_modal_inputs,
-            )
+        requests = build_rollout_requests_from_batch(
+            batch,
+            group_size=self.cfg.algorithm.group_size,
+            split_size=split_size,
+            enforce_divisible_batch=False,
+        )
+        for request in requests:
             self.dataloader_channel.put(request, async_op=True)
 
     def _sync_weights(self):
@@ -424,9 +442,15 @@ class ReasoningRunner:
             self.critic.sync_model_to_inference()
             self.critic_inference.sync_model_from_actor().wait()  # TODO change this name
 
+        # self.rollout here is always 'sync' mode (cpu/None weight_reload is only
+        # used by separate judge/eval rollouts), so this is unconditional.
         self.actor.sync_model_to_rollout()
         self.rollout.sync_model_from_actor().wait()
         self.actor.del_reshard_state_dict().wait()
+        # KV cache + cudagraph were deferred (only weights resumed) to avoid OOM;
+        # mirrors the offload condition — pure disaggregated never offloads them.
+        if self.component_placement.is_collocated or self.component_placement.is_auto:
+            self.rollout.onload_kv_cudagraph().wait()
 
     def run(self):
         epoch_iter = range(self.epoch, self.cfg.runner.max_epochs)

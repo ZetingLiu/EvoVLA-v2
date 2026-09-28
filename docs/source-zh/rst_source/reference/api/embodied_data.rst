@@ -1,64 +1,112 @@
 Embodied Data 接口
-====================
+==================
 
-本节介绍具身场景下 rollout 与训练过程中使用的核心数据结构：
-`EnvOutput`、`ChunkStepResult`、`EmbodiedRolloutResult` 和 `Trajectory`。
-它们共同完成从环境输出、chunk step 级结果累积，到轨迹化与批量训练输入的闭环。
+具身数据接口将运行时通信与 Actor 训练数据分开：
 
-整体关系
----------
+.. code-block:: text
 
-- `EnvOutput`：环境每个 chunk step 的原始输出（obs、reward、done 等）。
-- `ChunkStepResult`：模型推理结果与奖励信号在 chunk step 维度上的封装。
-- `EmbodiedRolloutResult`：将多个 chunk step 的结果与 transitions 逐步积累。
-- `Trajectory`：将累积结果整理为轨迹张量（形状通常为 `[T, B, ...]`）。
+   EnvOutput(obs, EnvTransition)
+       -> PolicyInput (+ previous EnvPart)
+       -> actions tensor
 
-其中 `EmbodiedRolloutResult.to_splited_trajectories()` 可将轨迹按 batch 维度切分，
-用于通过 Channel 分发给多个 Actor/Trainer。
+   PolicyPart + completed EnvPart
+       -> TrajectoryCollector
+       -> Trajectory / episode shard / pipeline micro-batch
 
-EnvOutput
+完整生命周期、数据所有权和执行模式语义参见
+:doc:`../../concepts/trajectory_collector`。
+
+Shape 记号
 ----------
 
-`EnvOutput` 描述环境侧的输出，包含 observation 与 episode 结束信号。
-在初始化时，张量会被移动到 CPU 并整理为连续内存。
+类字段注释使用以下符号：
 
-.. autoclass:: rlinf.data.embodied_io_struct.EnvOutput
+* ``B`` 是 routed environment batch。Decoupled merge 前通常为
+  ``env.train.total_num_envs / env_world_size /
+  rollout.pipeline_stage_num``。
+* ``C`` 是 ``actor.model.num_action_chunks``；only-eval 模式改用 Rollout model
+  config。
+* ``A`` 是 ``actor.model.action_dim``，``D = C * A``。令
+  ``E = env.train.rollout_epoch``，完整 trajectory 通常包含
+  ``T = E * env.train.max_steps_per_rollout_epoch / C`` 个 chunk。
+
+环境与策略消息
+--------------
+
+``EnvOutput`` 组合 observation 和一个 ``EnvTransition``，不再重复 reward 和
+boundary 字段。``PolicyInput`` 携带 observation，并可附带前一个 ``EnvPart``。
+Rollout 只将 action tensor 返回 Env；完整 ``PolicyOutput`` 留在 trajectory 路径，
+因为它还包含 log-probability、value、version 和 training input。
+
+.. autoclass:: rlinf.data.schema.embodied_types.EnvOutput
    :members:
    :member-order: bysource
 
-ChunkStepResult
-----------------
-
-`ChunkStepResult` 描述单步推理的结果与训练所需的附加信息，
-包含动作、对数概率、价值估计与额外的 forward inputs。
-初始化时会将张量统一移动到 CPU。
-
-.. autoclass:: rlinf.data.embodied_io_struct.ChunkStepResult
+.. autoclass:: rlinf.data.schema.embodied_types.EnvTransition
    :members:
    :member-order: bysource
 
-EmbodiedRolloutResult
------------------------
-
-`EmbodiedRolloutResult` 负责在 rollout 期间逐步积累 chunk step 级结果与 transitions，
-并提供转换为 `Trajectory` 的方法：
-
-- `append_step_result()`：追加 chunk step 级结果
-- `append_transitions()`：追加 curr/next transition 观测
-- `to_trajectory()`：拼接为轨迹张量
-- `to_splited_trajectories()`：按 batch 维度切分轨迹
-
-.. autoclass:: rlinf.data.embodied_io_struct.EmbodiedRolloutResult
+.. autoclass:: rlinf.data.schema.embodied_types.PolicyInput
    :members:
    :member-order: bysource
 
-Trajectory
-------------
+.. autoclass:: rlinf.data.schema.embodied_types.PolicyOutput
+   :members:
+   :member-order: bysource
 
-`Trajectory` 是最终进入训练流程的轨迹表示，包含动作、奖励、终止标记、
-观测与模型前向输入等字段。其张量维度一般为 `[T, B, ...]`，
-其中 **T 表示 chunk step 数**， **B 表示并行环境数** （batch 维度）。
+Trajectory Part
+---------------
 
-.. autoclass:: rlinf.data.embodied_io_struct.Trajectory
+``PolicyPart`` 和 ``EnvPart`` 是 Actor channel 仅有的两种输入，并通过
+``TrajectoryKey`` 配对。Channel routing 拆分 batch 时，``TrajectorySource``
+保留 source size 和 offset。Env 在 step 后创建未完成的 ``EnvPart``；Rollout 补充
+可选 terminal inference 数据后发布同一个类型。
+
+.. autoclass:: rlinf.data.schema.embodied_types.TrajectoryKey
+   :members:
+   :member-order: bysource
+
+.. autoclass:: rlinf.data.schema.embodied_types.TrajectorySource
+   :members:
+   :member-order: bysource
+
+.. autoclass:: rlinf.data.schema.embodied_types.PolicyPart
+   :members:
+   :member-order: bysource
+
+.. autoclass:: rlinf.data.schema.embodied_types.EnvPart
+   :members:
+   :member-order: bysource
+
+采集
+----
+
+``TrajectoryPlan`` 校验输出模式并推导 rollout geometry。所有具身模式都使用同一个
+公共 ``TrajectoryCollector``。
+
+.. autoclass:: rlinf.data.schema.embodied_trajectory.TrajectoryMode
+   :members:
+
+.. autoclass:: rlinf.data.schema.embodied_trajectory.TrajectoryPlan
+   :members:
+   :member-order: bysource
+
+.. autoclass:: rlinf.data.schema.embodied_trajectory.TrajectoryCollector
+   :members:
+   :member-order: bysource
+
+Actor 输出
+----------
+
+``TrajectoryStep`` 解析一对已配对的 policy/environment 数据，包括 reward、
+intervention 和 transition 语义。``Trajectory`` 再将 step 堆叠成
+``[T, B, ...]`` Actor tensor。Boundary 和 final-value 序列可能包含
+``T + E`` 个元素。
+
+.. autoclass:: rlinf.data.schema.embodied_types.TrajectoryStep
+   :members:
+   :member-order: bysource
+
+.. autoclass:: rlinf.data.schema.embodied_types.Trajectory
    :members:
    :member-order: bysource

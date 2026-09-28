@@ -14,11 +14,17 @@
 
 import logging
 from importlib.metadata import version
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 import torch
 from omegaconf import DictConfig
 from packaging.version import parse
+
+try:
+    from sglang.srt.constants import GPU_MEMORY_ALL_TYPES
+except ImportError:
+    # sglang 0.5.2/0.5.4 lack this symbol; these values are stable across versions.
+    GPU_MEMORY_ALL_TYPES = ["weights", "kv_cache", "cuda_graph"]
 from sglang.srt.managers.io_struct import (
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
@@ -50,6 +56,21 @@ from .io_struct import (
 logger.setLevel(logging.WARNING)
 
 
+def patch_glm4_moe_lite_shared_expert_tp1():
+    """Backport the sglang fix for GLM-4.7-Flash's MoE block.
+
+    Up to 0.5.12.post1, Glm4MoeLiteSparseMoeBlock calls nn.Module.__init__ instead
+    of DeepseekV2MoE.__init__, so the inherited forward reads an unset
+    _shared_expert_tp1 and cuda graph capture fails. sglang main sets it to False.
+    """
+    try:
+        from sglang.srt.models.glm4_moe_lite import Glm4MoeLiteSparseMoeBlock
+    except ImportError:
+        return
+    if not hasattr(Glm4MoeLiteSparseMoeBlock, "_shared_expert_tp1"):
+        Glm4MoeLiteSparseMoeBlock._shared_expert_tp1 = False
+
+
 class Scheduler(_Scheduler):
     """
     Overridden class of SGLang's TP worker class _Scheduler.
@@ -57,21 +78,32 @@ class Scheduler(_Scheduler):
     """
 
     def __init__(self, *args, **kwargs):
+        # Must run before super().__init__, which builds the model.
+        patch_glm4_moe_lite_shared_expert_tp1()
         super().__init__(*args, **kwargs)
         # `TpModelWorkerClient` is used when ServerArgs.enable_overlap=True, and it has 'worker' attribute.
         # But in early SGLang version, `TpModelWorker` doesn't have 'worker' attribute.
         if not hasattr(self.tp_worker, "worker"):
             self.tp_worker.worker = self.tp_worker
 
-        self._request_dispatcher._mapping.extend(
-            [
-                (TaskMethodInput, self.run_task_method),
-                (SyncHFWeightInput, self.sync_hf_weight),
-                (AbortGenerationInput, self.abort_generation),
-            ]
-        )
+        # In sglang 0.4.x `_mapping` was a list; in 0.5.x it's an OrderedDict
+        _extra_req_mapping = [
+            (TaskMethodInput, self.run_task_method),
+            (SyncHFWeightInput, self.sync_hf_weight),
+            (AbortGenerationInput, self.abort_generation),
+        ]
+        if isinstance(self._request_dispatcher._mapping, dict):
+            for _ty, _fn in _extra_req_mapping:
+                self._request_dispatcher._mapping[_ty] = _fn
+        else:
+            self._request_dispatcher._mapping.extend(_extra_req_mapping)
 
         self.is_weight_offloaded = False
+        # Per-tag offload state: tag -> True when currently offloaded. A single
+        # boolean cannot express the partial state that the OOM-safe split
+        # resume needs, where weights are onloaded but kv and cuda_graph are
+        # not. is_weight_offloaded above still gates the sync path.
+        self.offloaded_tags: dict = dict.fromkeys(GPU_MEMORY_ALL_TYPES, False)
         self.weight_norm_dict = None
 
         try:
@@ -94,14 +126,44 @@ class Scheduler(_Scheduler):
             f"{free_gpu_memory=:.2f} GiB, {total_gpu_memory=:.2f} GiB"
         )
 
+    def resolve_memory_tags(self, recv_req):
+        """Resolve a release/resume request's tags to a concrete set.
+
+        sglang treats tags=None/[] as "all GPU memory types".
+        """
+        if recv_req.tags is None or len(recv_req.tags) == 0:
+            return set(GPU_MEMORY_ALL_TYPES)
+        return set(recv_req.tags)
+
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
-        assert self.is_weight_offloaded is False, "Weight has been offloaded!"
-        self.is_weight_offloaded = True
-        return super().release_memory_occupation(recv_req)
+        requested_tags = self.resolve_memory_tags(recv_req)
+        already_offloaded = {
+            tag for tag in requested_tags if self.offloaded_tags.get(tag, False)
+        }
+        assert not already_offloaded, (
+            f"Cannot offload tags {sorted(requested_tags)}: "
+            f"{sorted(already_offloaded)} already offloaded. "
+            f"offload_state={self.offloaded_tags}"
+        )
+        for tag in requested_tags:
+            self.offloaded_tags[tag] = True
+        self.is_weight_offloaded = self.offloaded_tags.get("weights", False)
+        result = super().release_memory_occupation(recv_req)
+        return result
 
     def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
-        assert self.is_weight_offloaded is True, "Weight has been onloaded!"
-        self.is_weight_offloaded = False
+        requested_tags = self.resolve_memory_tags(recv_req)
+        not_offloaded = {
+            tag for tag in requested_tags if not self.offloaded_tags.get(tag, False)
+        }
+        assert not not_offloaded, (
+            f"Cannot onload tags {sorted(requested_tags)}: "
+            f"{sorted(not_offloaded)} are not offloaded (already onloaded). "
+            f"offload_state={self.offloaded_tags}"
+        )
+        for tag in requested_tags:
+            self.offloaded_tags[tag] = False
+        self.is_weight_offloaded = self.offloaded_tags.get("weights", False)
         result = super().resume_memory_occupation(recv_req)
         if self.weight_reload == "cpu":
             model = self.tp_worker.worker.model_runner.model
@@ -109,11 +171,48 @@ class Scheduler(_Scheduler):
 
         return result
 
+    @staticmethod
+    def _hf_to_sglang_name(model) -> Callable[[str], str]:
+        """Build a renamer from HuggingFace parameter names to sglang's.
+
+        transformers 5 nests a multimodal model's submodules under the wrapper --
+        ``model.visual.*`` and ``model.language_model.*`` -- where transformers 4
+        and sglang keep ``visual.*`` and ``model.*``. Feeding the new names to
+        sglang's ``load_weights`` fails deep inside it: its stacked-params mapping
+        rewrites ``gate_proj`` to ``gate_up_proj`` first, so the error surfaces as
+        ``KeyError: model.visual.blocks.0.mlp.gate_up_proj.weight`` for a
+        parameter that does exist, just one prefix over.
+
+        The rename is decided from the loaded sglang model, so a version whose
+        tree already matches the sender is left alone.
+
+        Args:
+            model: The sglang model to load weights into.
+
+        Returns:
+            A function mapping one HF parameter name to sglang's name for it.
+        """
+        param_names = dict(model.named_parameters()).keys()
+        renames = []
+        if any(name.startswith("visual.") for name in param_names):
+            renames.append(("model.visual.", "visual."))
+        if any(name.startswith("model.layers.") for name in param_names):
+            renames.append(("model.language_model.", "model."))
+
+        def rename(name: str) -> str:
+            for src, dst in renames:
+                if name.startswith(src):
+                    return dst + name[len(src) :]
+            return name
+
+        return rename
+
     def batch_load_hf_weight(self, state_dict: dict[str, Any]) -> Any:
         assert self.weight_reload == "sync", (
             "only sglang with 'sync' can run 'batch_load_hf_weight'"
         )
         model = self.tp_worker.worker.model_runner.model
+        rename = self._hf_to_sglang_name(model)
         rollout_sync_mode_collocated = (
             self.rollout_sync_mode == RolloutSyncMode.COLLOCATED
         )
@@ -126,11 +225,11 @@ class Scheduler(_Scheduler):
                 # in case two processes have different CUDA_VISIBLE_DEVICES
                 list_args[6] = torch.cuda.current_device()
                 new_weight = func(*list_args)
-                batch_weight.append((name, new_weight))
+                batch_weight.append((rename(name), new_weight))
         else:
             # disaggregate mode, recv tensor directly
             for name, tensor in state_dict.items():
-                batch_weight.append((name, tensor))
+                batch_weight.append((rename(name), tensor))
 
         model.load_weights(batch_weight)
 
@@ -159,10 +258,18 @@ class Scheduler(_Scheduler):
             # recv from the Megatron backend
             # Megatron use weight bucket to sync weight, the bucket length in dict of bucket 0, bucket_length
             state_dict.pop("bucket_length")
+            if isinstance(bucket_length, torch.Tensor):
+                bucket_length = bucket_length.item()
             assert bucket_length > 0, f"bucket_length {bucket_length} is invalid"
 
         if self.is_weight_offloaded:
-            self.resume_memory_occupation(ResumeMemoryOccupationReqInput())
+            # Resume model weights only. KV cache and cuda graph are deferred
+            # to onload_kv_cudagraph() in the runner, which runs after the
+            # actor offloads its model, so the two models are never both
+            # resident. Large MoE models OOM otherwise.
+            self.resume_memory_occupation(
+                ResumeMemoryOccupationReqInput(tags=["weights"])
+            )
 
         self.batch_load_hf_weight(state_dict)
         if bucket_length > 1:
@@ -246,9 +353,16 @@ class Scheduler(_Scheduler):
             self._actor_group_name = self.cfg.actor.group_name
             self.placement_mode = placement.placement_mode
             self.rollout_sync_mode = placement._rollout_sync_mode
-            self.actor_weight_rank = RankMapper.get_rollout_rank_to_actor_rank_map(
-                placement
-            )[(self._rlinf_worker.get_parent_rank(), self._rlinf_worker._rank)]
+            rollout_rank_map = RankMapper.get_rollout_rank_to_actor_rank_map(placement)
+            # Rollout's transmission coordinates are (engine_id,
+            # rank_in_engine), independent of sglang's internal attention
+            # sharding coordinates. Each tp rank receives from its source actor
+            # rank directly.
+            rollout_key = (
+                self._rlinf_worker.get_parent_rank(),
+                self._rlinf_worker._rank,
+            )
+            self.actor_weight_rank = rollout_rank_map[rollout_key]
 
             use_presharded_weights = (
                 False if self.cfg.actor.training_backend == "fsdp" else True
@@ -307,15 +421,14 @@ class Scheduler(_Scheduler):
 
     # to return output_ids and response_text simaltaneously in sglang 0.4.x.
     # copied from srt/managers/scheduler.py (0.4.6) and only delete the condition outside the assignment of "output_ids"
-    def stream_output_generation(
-        self,
-        reqs,
-        return_logprob: bool,
-        skip_req=None,
-    ):
-        # for sglang 0.5.0 and later, we use the original _handle_batch_output
+    def stream_output_generation(self, reqs, return_logprob, skip_req=None, **kwargs):
+        # for sglang 0.5.0 and later, we use the original _handle_batch_output.
+        # Extra arguments differ by sglang version (0.5.12 adds is_idle_batch),
+        # so forward whatever arrives instead of naming them.
         if not self.patch_return_output_ids:
-            return super().stream_output_generation(reqs, return_logprob, skip_req)
+            return super().stream_output_generation(
+                reqs, return_logprob, skip_req, **kwargs
+            )
 
         from sglang.srt.managers.scheduler_output_processor_mixin import (
             DEFAULT_FORCE_STREAM_INTERVAL,

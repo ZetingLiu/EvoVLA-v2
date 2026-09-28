@@ -158,7 +158,7 @@ Installation
 .. code:: bash
 
    # For mainland China users, you can use the following for better download speed:
-   # git clone https://ghfast.top/github.com/RLinf/RLinf.git
+   # git clone https://gh-proxy.com/github.com/RLinf/RLinf.git
    git clone https://github.com/RLinf/RLinf.git
    cd RLinf
 
@@ -176,9 +176,9 @@ STEAM shares the OpenPI environment with RECAP.
       --network host \
       --name rlinf \
       -v .:/workspace/RLinf \
-      rlinf/rlinf:agentic-rlinf0.2-maniskill_libero
+      rlinf/rlinf:agentic-rlinf0.4-maniskill_libero
       # For mainland China users, you can use the following for better download speed:
-      # docker.1ms.run/rlinf/rlinf:agentic-rlinf0.2-maniskill_libero
+      # infinigence-ai-registry.cn-beijing.cr.aliyuncs.com/rlinf/rlinf:agentic-rlinf0.4-maniskill_libero
 
 Please switch to the OpenPI virtual environment via the built-in ``switch_env`` utility:
 
@@ -589,7 +589,8 @@ File Structure
 Like RECAP, STEAM keeps its pipeline scripts self-contained under ``examples/``
 (the inference + labelling strategy that is bound to the model), the model /
 dataset code under ``rlinf/models`` and ``rlinf/data/datasets``, and shares the
-model-agnostic post-processing with RECAP via ``rlinf/data/process/``:
+model-agnostic post-processing with RECAP via
+``rlinf/algorithms/offline/process/``:
 
 .. code-block:: text
 
@@ -621,7 +622,7 @@ model-agnostic post-processing with RECAP via ``rlinf/data/process/``:
    │   ├── ensemble_modeling_critic.py          # worst-of-N + coerce_to_ensemble
    │   └── checkpoint_merge.py                  # ensemble checkpoint merge
    ├── data/datasets/steam/                     # pair_dataset.py, mixture.py, binning.py
-   └── data/process/                            # shared, model-agnostic (RECAP + STEAM)
+   └── algorithms/offline/process/              # shared, model-agnostic (RECAP + STEAM)
        ├── advantage.py                         # quantile threshold + boolean label
        ├── distributed.py                       # sharded-inference helpers
        └── mixture_config.py                    # meta/mixture_config.yaml tag I/O

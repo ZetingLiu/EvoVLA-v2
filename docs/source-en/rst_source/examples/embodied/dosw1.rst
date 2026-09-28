@@ -126,7 +126,7 @@ A. Clone RLinf Repository
 .. code:: bash
 
    # For mainland China users, you can use the following for better download speed:
-   # git clone https://ghfast.top/github.com/RLinf/RLinf.git
+   # git clone https://gh-proxy.com/github.com/RLinf/RLinf.git
    git clone https://github.com/RLinf/RLinf.git
    cd RLinf
 
@@ -161,7 +161,7 @@ A. Clone RLinf Repository
 .. code:: bash
 
    # For mainland China users, you can use the following for better download speed:
-   # git clone https://ghfast.top/github.com/RLinf/RLinf.git
+   # git clone https://gh-proxy.com/github.com/RLinf/RLinf.git
    git clone https://github.com/RLinf/RLinf.git
    cd RLinf
 
@@ -534,7 +534,7 @@ Troubleshooting
     configuration.
   - The GPU node can ``ping`` the robot and TCP-connect on 50050–50053.
 
-**``RuntimeError: DOSW1SDKAdapter is not connected``**
+**``RuntimeError: DOSW1Connection is not connected``**
   Connect was never called successfully. Re-check the preceding logs for
   ``[DOSW1SDK] Connecting via AirbotRobot``.
 

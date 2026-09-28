@@ -92,6 +92,18 @@
 渲染问题
 --------
 
+EGL 渲染使用哪块 GPU？
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+RLinf 会为每个 worker 指定渲染设备：向驱动查询该 worker 所分配 GPU 对应的 EGL 索引，并将其
+导出为 ``MUJOCO_EGL_DEVICE_ID``\ （MuJoCo、robosuite）和 ``EGL_DEVICE_ID``\ （其他 EGL 渲染器，
+如 pyrender）。这一步是必要的，因为 EGL 设备索引与 CUDA 设备号属于两套不同的命名空间：EGL 会
+列出驱动可见的所有设备，因此当容器只分配到节点上的部分 GPU 时，CUDA 设备 0 通常\ **并不是**
+EGL 设备 0。
+
+仅当需要覆盖该选择时才手动设置 ``MUJOCO_EGL_DEVICE_ID``，显式设置的值始终优先。若将其设为
+CUDA 序号，在两套命名空间不一致时会渲染到错误的 GPU 上。
+
 RuntimeError: The MUJOCO_EGL_DEVICE_ID environment variable must be an integer between 0 and 0 (inclusive), got 1.
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -211,6 +223,30 @@ Gloo 超时 / “Global rank x is not part of group”
 1. 在日志中定位上一阶段的 SGLang 错误。  
 2. 先解决 SGLang 的恢复/显存问题。  
 3. 重新启动作业（必要时也重启 Ray）。
+
+FSDP 集合通信被后端看门狗超时杀掉
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+**现象：** 训练步仍在正常推进，FSDP actor 却被集合通信看门狗杀掉：
+
+.. code-block:: text
+
+   WorkNCCL(SeqNum=1878, OpType=_ALLGATHER_BASE, ..., Timeout(ms)=1800000) ran for
+   1800000 milliseconds before timing out.
+
+报错里的超时值来自后端自带的默认值——NCCL 和 Gloo 是 1800000 ms，昇腾 HCCL 是 3636000 ms。
+
+**可能原因：** 某个 rank 在两次 FSDP 集合通信之间耗时超过了这个时间——例如梯度累积步过大、
+checkpoint 写入过慢，或者该 rank 挂在调试器里，而其余 rank 都在 all-gather 处等待。
+
+**修复：** FSDP 的集合通信与 RLinf 其余 worker 间通信共用同一个超时，默认 180 分钟。
+用 ``RLINF_TIMEOUT`` 调大它（单位为分钟）：
+
+.. code-block:: bash
+
+   export RLINF_TIMEOUT=360
+
+Ray 会在启动时捕获环境变量，因此必须在每个节点上 ``ray start`` **之前** 导出。
 
 数值精度 / 推理后端
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

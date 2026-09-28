@@ -69,7 +69,7 @@ def _extract_json_object(text: str) -> dict[str, Any] | None:
     return None
 
 
-def _parse_qwentrend_output(text: str) -> str | None:
+def _parse_vlm_trend_reward_output(text: str) -> str | None:
     valid_labels = {"positive", "negative", "unclear"}
     obj = _extract_json_object(text)
     if obj is not None:
@@ -81,8 +81,8 @@ def _parse_qwentrend_output(text: str) -> str | None:
     return matches[-1] if matches else None
 
 
-@register_reward_parser("qwentrend_reward_parser")
-class QwentrendRewardParser(BaseRewardParser):
+@register_reward_parser("vlm_trend_reward_parser")
+class VLMTrendRewardParser(BaseRewardParser):
     def __init__(
         self,
         positive_reward: float = 1.0,
@@ -107,7 +107,7 @@ class QwentrendRewardParser(BaseRewardParser):
         pos_count, neg_count, unclear_count, invalid_count = 0, 0, 0, 0
         invalid_examples: list[str] = []
         for output in outputs:
-            label = _parse_qwentrend_output(output)
+            label = _parse_vlm_trend_reward_output(output)
             if label == "positive":
                 rewards.append(self.positive_reward)
                 pos_count += 1
@@ -141,4 +141,32 @@ class QwentrendRewardParser(BaseRewardParser):
                     "[RMDBG_PARSE] invalid_samples=%s",
                     invalid_examples,
                 )
+        return torch.tensor(rewards, dtype=torch.float32)
+
+
+@register_reward_parser("vlm_trend_binary_digit_reward_parser")
+class VLMTrendBinaryDigitRewardParser(BaseRewardParser):
+    """Map generated binary success labels to sparse rewards."""
+
+    def __init__(
+        self,
+        positive_reward: float = 1.0,
+        negative_reward: float = 0.0,
+        invalid_reward: float = 0.0,
+    ) -> None:
+        self.positive_reward = float(positive_reward)
+        self.negative_reward = float(negative_reward)
+        self.invalid_reward = float(invalid_reward)
+
+    def parse_rewards(self, outputs: list[str]) -> torch.Tensor:
+        """Map a trailing ``1`` to the success reward and ``0`` to non-success."""
+        rewards = []
+        for output in outputs:
+            labels = re.findall(r"(?<!\d)([01])(?!\d)", str(output).strip())
+            if labels and labels[-1] == "1":
+                rewards.append(self.positive_reward)
+            elif labels and labels[-1] == "0":
+                rewards.append(self.negative_reward)
+            else:
+                rewards.append(self.invalid_reward)
         return torch.tensor(rewards, dtype=torch.float32)

@@ -12,20 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
 from dataclasses import dataclass, field
 from typing import Any, Optional, Union
 
 import torch
 from PIL import Image
-from transformers import AutoProcessor
-
-from rlinf.data.datasets.vlm import (
-    QwenTrendProgressSFTDataset,
-    VLMBaseDataset,
-)
-
-logger = logging.getLogger(__name__)
 
 
 def _to_pil_images(
@@ -103,7 +94,7 @@ class BaseInputBuilder:
     system_prompt: Optional[str] = None
     use_chat_template: bool = True
     image_keys: list[str] = field(default_factory=lambda: ["main_images"])
-    _processor: Optional[AutoProcessor] = field(default=None)
+    _processor: Optional[Any] = field(default=None)
 
     def get_valid_input_ids(self, observations: dict[str, Any]) -> list[int]:
         return list(range(len(observations[self.image_keys[0]])))
@@ -154,6 +145,8 @@ class BaseVLMInputBuilder(BaseInputBuilder):
         }
 
     def process_inputs(self, prepared_inputs: dict[str, Any]):
+        from rlinf.data.datasets.vlm.base import VLMBaseDataset
+
         prompt_texts_list = prepared_inputs.get("prompt_texts_list")
         images_list = prepared_inputs.get("images_list")
 
@@ -178,9 +171,9 @@ class BaseVLMInputBuilder(BaseInputBuilder):
         return processed_inputs
 
 
-@register_input_builder("history_vlm_input_builder")
+@register_input_builder("buffered_vlm_input_builder")
 @dataclass(kw_only=True)
-class HistoryVLMInputBuilder(BaseVLMInputBuilder):
+class BufferedVLMInputBuilder(BaseVLMInputBuilder):
     history_buffer_names: list[str]
 
     def get_valid_input_ids(
@@ -232,8 +225,9 @@ class HistoryVLMInputBuilder(BaseVLMInputBuilder):
 
 @register_input_builder("video_vlm_input_builder")
 @dataclass
-class VideoVLMInputBuilder(HistoryVLMInputBuilder):
+class VideoVLMInputBuilder(BufferedVLMInputBuilder):
     video_keys: list[str] = field(default_factory=lambda: ["main_images"])
+    video_fps: float = 24.0
 
     def extract_videos(
         self,
@@ -265,13 +259,23 @@ class VideoVLMInputBuilder(HistoryVLMInputBuilder):
         return videos
 
 
-@register_input_builder("qwentrend_input_builder")
+@register_input_builder("vlm_trend_reward_input_builder")
 @dataclass
-class QwentrendInputBuilder(VideoVLMInputBuilder):
+class VLMTrendRewardInputBuilder(VideoVLMInputBuilder):
     video_keys: list[str] = field(
         default_factory=lambda: ["main_images", "extra_view_images"]
     )
     default_task_description: str = ""
+
+    def _render_prompt(self, task: str) -> str:
+        task = str(task or self.default_task_description).strip()
+        return (
+            f"You are currently performing the task: {task}. "
+            "You are given two synchronized 5-frame videos from different camera "
+            "views (main view and third-person view) of the same robot action "
+            "window. Judge whether the action trend is positive, negative, or "
+            "unclear. Answer with exactly one word: positive, negative, or unclear."
+        )
 
     def prepare_inputs(
         self,
@@ -287,17 +291,10 @@ class QwentrendInputBuilder(VideoVLMInputBuilder):
             [self.default_task_description] * len(videos_clip),
         )
 
-        prompt_texts_list: list[list[str]] = []
-        for env_id in valid_input_ids:
-            prompt_texts_list.append(
-                [
-                    f"You are currently performing the task: {task_descriptions[env_id]}. "
-                    "You are given two synchronized 5-frame videos from different camera "
-                    "views (main view and third-person view) of the same robot action "
-                    "window. Judge whether the action trend is positive, negative, or "
-                    "unclear. Answer with exactly one word: positive, negative, or unclear."
-                ]
-            )
+        prompt_texts_list = [
+            [self._render_prompt(task_descriptions[env_id])]
+            for env_id in valid_input_ids
+        ]
 
         return {
             "images_list": None,
@@ -306,15 +303,38 @@ class QwentrendInputBuilder(VideoVLMInputBuilder):
         }
 
     def process_inputs(self, prepared_inputs: dict[str, Any]):
+        from rlinf.data.datasets.vlm.vlm_trend_reward import VLMTrendRewardSFTDataset
+
         prompt_texts_list = prepared_inputs.get("prompt_texts_list")
         videos_list = prepared_inputs.get("videos_list")
 
-        _, processed_inputs, _ = QwenTrendProgressSFTDataset.process_inputs(
+        _, processed_inputs, _ = VLMTrendRewardSFTDataset.process_inputs(
             processor=self._processor,
             system_prompt=self.system_prompt,
             use_chat_template=self.use_chat_template,
             prompt_texts=prompt_texts_list,
             videos=videos_list,
             answer_text=None,
+            video_fps=self.video_fps,
         )
         return processed_inputs
+
+
+@register_input_builder("vlm_trend_success_potential_input_builder")
+@dataclass
+class VLMTrendSuccessPotentialInputBuilder(VLMTrendRewardInputBuilder):
+    """Render configurable Success/Potential prompts without changing Trend defaults."""
+
+    prompt_template: str = "{task_text}"
+    include_task: bool = True
+    num_bins: int = 10
+
+    def _render_prompt(self, task: str) -> str:
+        task = str(task or self.default_task_description).strip()
+        task_text = f" Task: {task}." if self.include_task and task else ""
+        return self.prompt_template.format(
+            task=task,
+            task_text=task_text,
+            num_bins=self.num_bins,
+            num_bins_max=self.num_bins - 1,
+        )

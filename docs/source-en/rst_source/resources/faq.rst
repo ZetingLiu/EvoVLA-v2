@@ -95,6 +95,21 @@ Using Ray Legacy Debugger (Fallback)
 Rendering Issues
 ------------------------------------
 
+Which GPU does EGL rendering use?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+RLinf assigns each worker its own rendering device: it asks the driver for the
+EGL index of the GPU that worker was given and exports it as
+``MUJOCO_EGL_DEVICE_ID`` (MuJoCo, robosuite) and ``EGL_DEVICE_ID`` (other EGL
+renderers, e.g. pyrender). This matters because EGL device indices and CUDA
+device ids are different namespaces: EGL lists every device the driver can see,
+so in a container holding a subset of a node's GPUs, CUDA device 0 is usually
+*not* EGL device 0.
+
+Set ``MUJOCO_EGL_DEVICE_ID`` yourself only to override that choice; an explicit
+value is always respected. Setting it to a CUDA ordinal renders on the wrong GPU
+whenever the two namespaces disagree.
+
 RuntimeError: The MUJOCO_EGL_DEVICE_ID environment variable must be an integer between 0 and 0 (inclusive), got 1.
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -221,6 +236,35 @@ generation from completing. Megatron then waits until Gloo times out.
 1. Check logs for the SGLang error from the previous step.
 2. Resolve the underlying SGLang restore/memory issue.
 3. Relaunch the job (and Ray, if needed).
+
+FSDP Collective Times Out on the Backend Watchdog
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+**Symptom:** An FSDP actor is killed by the collective watchdog even though the
+step was still making progress:
+
+.. code-block:: text
+
+   WorkNCCL(SeqNum=1878, OpType=_ALLGATHER_BASE, ..., Timeout(ms)=1800000) ran for
+   1800000 milliseconds before timing out.
+
+The timeout in the message is the backend's built-in default — 1800000 ms on
+NCCL and Gloo, 3636000 ms on Ascend HCCL.
+
+**Likely Cause:** One rank spent longer than that between two FSDP collectives —
+a large gradient accumulation step, a slow checkpoint write, or a rank paused
+under a debugger while the others wait in an all-gather.
+
+**Fix:** FSDP collectives use the same timeout as the rest of RLinf's
+inter-worker communication, which defaults to 180 minutes. Raise it with
+``RLINF_TIMEOUT``, in minutes:
+
+.. code-block:: bash
+
+   export RLINF_TIMEOUT=360
+
+Ray captures the environment when it starts, so export this on every node
+**before** ``ray start``.
 
 Numerical Precision / Inference backend
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
