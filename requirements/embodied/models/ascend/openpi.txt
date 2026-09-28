@@ -1,3 +1,7 @@
 # TensorFlow 2.20+ segfaults on import next to torch-npu; 2.19 keeps JAX's ml-dtypes.
+# Keep the root protobuf>=6.33.5 override even though TensorFlow declares <6:
+# Ray 2.58's Google RPC gencode is 6.33.5 and a protobuf 5 runtime prevents the
+# Ray node from starting. TensorFlow 2.19 emits legacy MessageFactory warnings
+# with protobuf 6, but imports and executes correctly on this stack.
 tensorflow==2.19.1
 tensorboard==2.19.0

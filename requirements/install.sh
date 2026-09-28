@@ -2398,9 +2398,20 @@ install_openpi_model() {
     # Enforce RLinf-compatible runtime pins to avoid known breakages.
     # openpi/orbax require jax.experimental.layout.DeviceLocalLayout (removed in jax>=0.7.0).
     uv pip install -r "$SCRIPT_DIR/embodied/models/openpi.txt"
-    if [ "$PLATFORM" = "ascend" ]; then
+    if [ "$PLATFORM" = "nvidia" ]; then
+        uv pip install "jax[cuda12]==0.5.3"
+    elif [ "$PLATFORM" = "ascend" ]; then
         uv pip install -r "$SCRIPT_DIR/embodied/models/ascend/openpi.txt"
     fi
+
+    # OpenPI and the CALVIN language encoder use the PyTorch Transformers
+    # backend. Disabling the unused TensorFlow backend avoids Transformers
+    # importing Keras 3 (unsupported by this fork) while preserving JAX.
+    local disable_tf_line="export USE_TF=0"
+    if ! grep -qxF "$disable_tf_line" "$VENV_DIR/bin/activate"; then
+        printf '%s\n' "$disable_tf_line" >> "$VENV_DIR/bin/activate"
+    fi
+    export USE_TF=0
 
     # Replace transformers models with OpenPI's modified versions
     local py_major_minor

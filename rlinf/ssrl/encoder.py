@@ -31,6 +31,8 @@ Design (locked in the plan):
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -58,7 +60,7 @@ class R3MVisualEncoder(nn.Module):
     def __init__(
         self,
         backbone: str = "r3m_resnet18",
-        latent_dim: int = 2048,  # real R3M resnet18 output (512ch x 2x2 spatial)
+        latent_dim: int = 512,  # torchvision ResNet-18 global-average-pool output
         proj_dim: int = 512,  # CLIP text dim
         freeze_backbone: bool = True,
         image_size: int = 224,
@@ -70,11 +72,9 @@ class R3MVisualEncoder(nn.Module):
         # Lazy: importing r3m / torchvision at module import time would
         # break the import-light contract of rlinf.ssrl.
         r3m = self._load_r3m_backend()
-        # ``load_r3m`` wraps the model in ``nn.DataParallel``, which scatters
-        # the input to ALL visible GPUs and gathers the output on cuda:0 —
-        # the projection head lives on ``self.device`` (e.g. cuda:3), so the
-        # DP wrapper would mix devices on multi-GPU actors.  Unwrap it and
-        # run the plain module on ``self.device``.
+        # Older R3M loaders may wrap the model in ``nn.DataParallel``, which
+        # would scatter to every visible accelerator. Keep only the module so
+        # RLinf owns device placement for each actor.
         if isinstance(r3m, torch.nn.DataParallel):
             r3m = r3m.module
         self.backbone = r3m  # R3M resnet, own resize+normalize
@@ -88,14 +88,34 @@ class R3MVisualEncoder(nn.Module):
     @staticmethod
     def _load_r3m_backend() -> nn.Module:
         try:
-            from r3m import load_r3m
+            from huggingface_hub import hf_hub_download
+            from r3m.models.models_r3m import R3M
         except ImportError as exc:  # pragma: no cover - env-dependent
             raise RuntimeError(
-                "R3M is not installed. SSRL requires `r3m` (see external/r3m) "
-                "and the CLIP transformers model; install them after user "
-                "authorization (plan §6)."
+                "SSRL requires the `r3m` package and `huggingface_hub`; "
+                "install requirements/embodied/models/openpi.txt."
             ) from exc
-        return load_r3m("resnet18")  # output dim 512
+
+        weights_path = os.getenv("R3M_RESNET18_WEIGHTS")
+        if weights_path is None:
+            weights_path = hf_hub_download(
+                repo_id="surajnair/r3m-18",
+                filename="pytorch_model.bin",
+            )
+
+        # The author's HF checkpoint contains the inference-only visual tower
+        # (44.8 MB), unlike the legacy 330 MB Google Drive training checkpoint.
+        # weights_only avoids arbitrary pickle object deserialization.
+        state_dict = torch.load(weights_path, map_location="cpu", weights_only=True)
+        model = R3M(
+            device="cpu",
+            lr=0.0,
+            hidden_dim=1024,
+            size=18,
+            langweight=0.0,
+        )
+        model.load_state_dict(state_dict, strict=True)
+        return model
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         """Encode ``images`` ``[B, H, W, 3]`` uint8 (HWC) into ``[B, latent]``.
@@ -113,6 +133,11 @@ class R3MVisualEncoder(nn.Module):
         x = images.float().permute(0, 3, 1, 2).contiguous()  # [B, 3, H, W]
         out = self.backbone(x, obs_shape=[3, x.shape[-2], x.shape[-1]])
         out = out.reshape(out.shape[0], -1)  # [B, latent_dim]
+        if out.shape[-1] != self.latent_dim:
+            raise RuntimeError(
+                "R3M output dimension does not match encoder.latent_dim: "
+                f"got {out.shape[-1]}, configured {self.latent_dim}."
+            )
         return F.normalize(out, dim=-1)
 
 
@@ -137,7 +162,18 @@ class CLIPTextEncoder:
 
         self.device = device
         self.tokenizer = CLIPTokenizer.from_pretrained(model_name)
-        self.model = CLIPTextModel.from_pretrained(model_name).to(device).eval()
+        # torch-npu 2.6 cannot execute the Transformers SDPA path used by
+        # CLIP ("can not cast format when output is input"). The eager
+        # implementation uses the same weights and is portable across CPU,
+        # CUDA and NPU.
+        self.model = (
+            CLIPTextModel.from_pretrained(
+                model_name,
+                attn_implementation="eager",
+            )
+            .to(device)
+            .eval()
+        )
         for p in self.model.parameters():
             p.requires_grad = False
         self._cache: dict[str, torch.Tensor] = {}

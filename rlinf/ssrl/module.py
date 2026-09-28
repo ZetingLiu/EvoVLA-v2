@@ -119,7 +119,7 @@ class SSRLModule(nn.Module):
         enc_cfg = cfg.get("encoder", {})
         self.visual = R3MVisualEncoder(
             backbone=enc_cfg.get("backbone", "r3m_resnet18"),
-            latent_dim=int(enc_cfg.get("latent_dim", 2048)),
+            latent_dim=int(enc_cfg.get("latent_dim", 512)),
             proj_dim=int(enc_cfg.get("proj_dim", 512)),
             freeze_backbone=self.freeze_backbone,
         ).to(device)
@@ -144,7 +144,7 @@ class SSRLModule(nn.Module):
         icm_input_dim = (
             self.icm_state_dim
             if self.icm_space == "pose"
-            else int(enc_cfg.get("latent_dim", 2048))
+            else int(enc_cfg.get("latent_dim", 512))
         )
         self.icm = ICM(
             latent_dim=icm_input_dim,

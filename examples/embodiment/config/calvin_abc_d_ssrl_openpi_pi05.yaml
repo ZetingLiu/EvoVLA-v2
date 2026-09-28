@@ -107,8 +107,8 @@ algorithm:
     num_action_chunks: ${actor.model.num_action_chunks}
     encoder:
       backbone: r3m_resnet18
-      latent_dim: 2048           # REAL R3M resnet18 output dim (512ch x 2x2 spatial), not 512
-      proj_dim: 512              # CLIP text dim; projection head maps 2048 -> 512
+      latent_dim: 512            # R3M ResNet-18 output after global average pooling
+      proj_dim: 512              # CLIP text dim; projection head maps 512 -> 512
       info_nce_temperature: 0.1
       positive_window: 3
       lang_align_coef: 0.5      # language alignment auxiliary (warmup + online)

@@ -2,6 +2,10 @@
 # Keep these pins to avoid known compatibility breakages:
 # - openpi pins jax==0.5.3; orbax-checkpoint==0.11.13 imports
 #   jax.experimental.layout.DeviceLocalLayout, which was removed in jax>=0.7.0.
-jax[cuda12]==0.5.3
+# Keep the shared requirement hardware-neutral. install.sh adds the CUDA extra
+# only for NVIDIA; Ascend and other platforms must not pull NVIDIA libraries.
+jax==0.5.3
 orbax-checkpoint==0.11.13
 tyro==1.0.13
+# EvoVLA SSRL visual encoder. Pin the upstream source for reproducibility.
+r3m @ git+https://github.com/facebookresearch/r3m.git@b2334e726887fa0206962d7984c69c5fb09cceab

@@ -11,22 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Regression tests for the SSRL encoder dim contract.
+"""Regression tests for the SSRL encoder dimension contract.
 
-The real R3M resnet18 outputs **2048-d** embeddings (512 channels over a
-2x2 spatial grid, flattened), NOT 512-d.  ``algorithm.ssrl.encoder.latent_dim``
-feeds the ``ProjectionHead`` input dimension, so a config value of 512
-silently breaks at runtime (``nn.Linear(512, 512)`` receiving 2048) — a bug
-the stub-based tests in ``test_module_smoke.py`` cannot catch because their
-stub outputs exactly the configured ``latent_dim``.
+The official R3M ResNet-18 uses torchvision's global average pool and outputs
+**512-d** embeddings. ``algorithm.ssrl.encoder.latent_dim`` feeds the
+``ProjectionHead`` input dimension, so the config and backend must agree.
 
 These tests pin the contract from both sides (pure CPU, no R3M weights):
 
-- ``test_ssrl_yaml_latent_dim_matches_real_r3m`` — the shipped SSRL yaml
-  must keep ``latent_dim: 2048`` (catches a revert to 512).
-- ``test_module_compute_with_2048_stub`` / ``test_module_rejects_512_config``
-  — a 2048-d stub (real-R3M-shaped) must work end-to-end, and a 512 config
-  must fail loudly instead of silently mis-wiring.
+- ``test_ssrl_yaml_latent_dim_matches_real_r3m`` pins the shipped YAML to 512.
+- ``test_module_compute_with_512_stub`` / ``test_module_rejects_2048_config``
+  verify the valid path and a clear error for a mismatched configuration.
 """
 
 import pathlib
@@ -39,12 +34,12 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 _EMBODIED_PATH = _REPO_ROOT / "examples" / "embodiment"
 
 
-class _StubR3M2048(nn.Module):
-    """Interface-compatible stand-in for the real R3M resnet18 (2048-d out)."""
+class _StubR3M512(nn.Module):
+    """Interface-compatible stand-in for the real R3M ResNet-18."""
 
     def __init__(self):
         super().__init__()
-        self.lin = nn.Linear(3, 2048)
+        self.lin = nn.Linear(3, 512)
 
     def forward(self, x, obs_shape=None):  # noqa: D102 - mirrors r3m API
         pooled = x.float().mean(dim=(2, 3)) / 255.0  # [N, 3]
@@ -52,7 +47,7 @@ class _StubR3M2048(nn.Module):
 
 
 def test_ssrl_yaml_latent_dim_matches_real_r3m(monkeypatch):
-    """The shipped SSRL config must use the real R3M output dim (2048)."""
+    """The shipped SSRL config must use the real R3M output dimension."""
     monkeypatch.setenv("EMBODIED_PATH", str(_EMBODIED_PATH))
     import hydra
     from omegaconf import OmegaConf
@@ -63,9 +58,9 @@ def test_ssrl_yaml_latent_dim_matches_real_r3m(monkeypatch):
         cfg = hydra.compose(config_name="calvin_abc_d_ssrl_openpi_pi05")
 
     enc = OmegaConf.to_container(cfg.algorithm.ssrl.encoder, resolve=True)
-    assert enc["latent_dim"] == 2048, (
-        "encoder.latent_dim must be 2048 (real R3M resnet18 output dim); "
-        "512 would crash the projection head at runtime."
+    assert enc["latent_dim"] == 512, (
+        "encoder.latent_dim must be 512 (real R3M ResNet-18 output dim); "
+        "other values would crash the projection head at runtime."
     )
     assert enc["proj_dim"] == 512  # CLIP text dim, unchanged
 
@@ -96,7 +91,7 @@ def _make_module(monkeypatch, latent_dim: int):
     from rlinf.ssrl.encoder import R3MVisualEncoder
 
     monkeypatch.setattr(
-        R3MVisualEncoder, "_load_r3m_backend", staticmethod(lambda: _StubR3M2048())
+        R3MVisualEncoder, "_load_r3m_backend", staticmethod(lambda: _StubR3M512())
     )
     from omegaconf import OmegaConf
 
@@ -121,17 +116,17 @@ def _make_module(monkeypatch, latent_dim: int):
     return SSRLModule(cfg, torch.device("cpu"))
 
 
-def test_module_compute_with_2048_stub(monkeypatch):
-    """latent_dim=2048 + 2048-d stub: full compute path must work."""
-    module = _make_module(monkeypatch, latent_dim=2048)
+def test_module_compute_with_512_stub(monkeypatch):
+    """latent_dim=512 plus a 512-d stub must work end to end."""
+    module = _make_module(monkeypatch, latent_dim=512)
     intrinsic, metrics = module.compute_intrinsic_rewards(_fake_batch())
     assert intrinsic.shape == (4, 2, 5)
     assert torch.isfinite(intrinsic).all()
     assert "ssrl/r_con_norm" in metrics and "ssrl/r_cur_norm" in metrics
 
 
-def test_module_rejects_512_config(monkeypatch):
-    """latent_dim=512 against a real-shaped backbone must fail loudly."""
-    module = _make_module(monkeypatch, latent_dim=512)
-    with pytest.raises(RuntimeError, match="mat1 and mat2|input features"):
+def test_module_rejects_2048_config(monkeypatch):
+    """A mismatched 2048-d configuration must fail loudly."""
+    module = _make_module(monkeypatch, latent_dim=2048)
+    with pytest.raises(RuntimeError, match="R3M output dimension"):
         module.compute_intrinsic_rewards(_fake_batch())
